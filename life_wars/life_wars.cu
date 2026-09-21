@@ -89,6 +89,18 @@ int main() {
     for (int s = 0; s < steps; s++) {
         life_step<<<g, block>>>(cur, nxt, H, W);
         std::swap(cur, nxt);
+
+        // the blocking memcpy waits for the kernel, so this is for watching
+        // the population only; drop it when timing
+        if ((s + 1) % 10 == 0) {
+            CUDA_CHECK(cudaMemcpy(grid.data(), cur + W, H * W, cudaMemcpyDeviceToHost));
+            int red = 0, blue = 0;
+            for (uint8_t v : grid) {
+                red += (v == 1);
+                blue += (v == 2);
+            }
+            printf("step %3d: live %6d (red %6d, blue %6d)\n", s + 1, red + blue, red, blue);
+        }
     }
     CUDA_CHECK(cudaGetLastError());
     // an out-of-bounds read in a kernel surfaces here, not at the launch
