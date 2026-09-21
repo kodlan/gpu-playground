@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <cstdint>
+#include <string>
 #include <utility>
 #include <vector>
 #include "../common/check.h"
@@ -47,6 +48,56 @@ __global__ void life_step(const uint8_t* cur, uint8_t* next, int rows, int colum
         out = (red >= 2) ? 1 : 2;
 
     next[y * columns + c] = out;
+}
+
+// Shrink the band by `shrink` in each direction into an RGB image: each output
+// pixel shows the colour that has more cells in its shrink x shrink block.
+__global__ void downsample(const uint8_t* __restrict__ cur, int rows, int colums, int shrink, uint8_t* rgb, int out_w) {
+    int ox = blockIdx.x * blockDim.x + threadIdx.x;
+    int oy = blockIdx.y * blockDim.y + threadIdx.y;
+
+    int out_h = rows / shrink;
+    if (ox >= out_w || oy >= out_h)
+        return;
+
+    int red = 0, blue = 0;
+    for (int dy = 0; dy < shrink; dy++) {
+        for (int dx = 0; dx < shrink; dx++) {
+            uint8_t v = cur[(oy * shrink + dy + 1) * colums + ox * shrink + dx];
+            red += (v == 1);
+            blue += (v == 2);
+        }
+    }
+
+    uint8_t* p = rgb + (oy * out_w + ox) * 3;
+    int total = shrink * shrink;
+
+    // brightness = how full the block is; hue = which colour dominates
+    int level = (red + blue) * 255 / total;
+
+    if (red > blue) {
+        p[0] = 40 + level * 215 / 255;
+        p[1] = 20;
+        p[2] = 20;
+    } else if (blue > red) {
+        p[0] = 20;
+        p[1] = 60 + level * 100 / 255;
+        p[2] = 60 + level * 195 / 255;
+    } else if (red) {
+        p[0] = p[1] = p[2] = 30 + level * 100 / 255;
+    } else {
+        p[0] = p[1] = p[2] = 8;
+    }
+}
+
+static void write_ppm(const std::string& path, const uint8_t* rgb, int w, int h) {
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) {
+        perror(path.c_str()); exit(1);
+    }
+    fprintf(f, "P6\n%d %d\n255\n", w, h);
+    fwrite(rgb, 1, (size_t)w * h * 3, f);
+    fclose(f);
 }
 
 int main() {
@@ -113,6 +164,25 @@ int main() {
         live += (v != 0);
     printf("live cells after %d steps: %d (%.2f%%)\n", steps, live, 100.0 * live / (H * W));
 
+    // render the final grid: shrink x shrink cells per pixel, straight from the
+    // device buffer (downsample skips the halo row itself, so pass cur, not cur + W)
+    const int shrink = 4;
+    const int out_w = W / shrink, out_h = H / shrink;
+    size_t rgb_bytes = (size_t)out_w * out_h * 3;
+
+    uint8_t* d_rgb = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_rgb, rgb_bytes));
+
+    dim3 og((out_w + block.x - 1) / block.x, (out_h + block.y - 1) / block.y);
+    downsample<<<og, block>>>(cur, H, W, shrink, d_rgb, out_w);
+    CUDA_CHECK(cudaGetLastError());
+
+    std::vector<uint8_t> rgb(rgb_bytes);
+    CUDA_CHECK(cudaMemcpy(rgb.data(), d_rgb, rgb_bytes, cudaMemcpyDeviceToHost));
+    write_ppm("frame.ppm", rgb.data(), out_w, out_h);
+    printf("wrote frame.ppm (%dx%d)\n", out_w, out_h);
+
+    CUDA_CHECK(cudaFree(d_rgb));
     CUDA_CHECK(cudaFree(cur));
     CUDA_CHECK(cudaFree(nxt));
 
