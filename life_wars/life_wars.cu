@@ -1,6 +1,6 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
-#include "check.h"
+#include "../common/check.h"
 
 int main() {
     int have = 0;
