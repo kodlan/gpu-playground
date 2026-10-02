@@ -283,30 +283,53 @@ static std::vector<uint8_t> simulate(const std::vector<uint8_t>& init, int n, in
     gather();
 
     if (rgb) {
-        // render each band on its own GPU, straight from the device buffer
-        // (downsample skips the halo row itself, so pass cur, not cur + W),
-        // then copy each band's strip into its slice of the host image. Band r
-        // covers output rows from row0[r] / shrink; rows[r] is a multiple of
-        // shrink for H = 2048 and n <= 2.
+        // Each rank shrinks its own band on its own GPU, straight from the
+        // device buffer (downsample skips the halo row itself, so pass cur,
+        // not cur + W). Band r's strip is out_w x (rows[r] / shrink) pixels;
+        // rows[r] is a multiple of shrink for H = 2048 and n <= 2.
         const int shrink = 4;
         const int out_w = W / shrink, out_h = H / shrink;
         rgb->resize((size_t)out_w * out_h * 3);
 
+        uint8_t* d_rgb[2] = {nullptr, nullptr};
+        size_t strip_bytes[2] = {0, 0};
         for (int r = 0; r < n; r++) {
             CUDA_CHECK(cudaSetDevice(r));
             int band_h = rows[r] / shrink;
-            size_t strip_bytes = (size_t)out_w * band_h * 3;
-
-            uint8_t* d_rgb = nullptr;
-            CUDA_CHECK(cudaMalloc(&d_rgb, strip_bytes));
+            strip_bytes[r] = (size_t)out_w * band_h * 3;
+            CUDA_CHECK(cudaMalloc(&d_rgb[r], strip_bytes[r]));
 
             dim3 og((out_w + block.x - 1) / block.x, (band_h + block.y - 1) / block.y);
-            downsample<<<og, block, 0, streams[r]>>>(cur[r], rows[r], W, shrink, d_rgb, out_w);
+            downsample<<<og, block, 0, streams[r]>>>(cur[r], rows[r], W, shrink, d_rgb[r], out_w);
             CUDA_CHECK(cudaGetLastError());
+        }
 
-            CUDA_CHECK(cudaMemcpy(rgb->data() + (size_t)(row0[r] / shrink) * out_w * 3, d_rgb,
-                                  strip_bytes, cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaFree(d_rgb));
+        // Rank 1's small image has to reach rank 0, which writes the file:
+        // one more send/recv pair in a group. Both calls sit behind the
+        // downsample kernels on their streams, so the strips are finished
+        // when the bytes move.
+        uint8_t* d_recv = nullptr;  // rank 1's strip, landed on GPU 0
+        if (n > 1) {
+            CUDA_CHECK(cudaSetDevice(0));
+            CUDA_CHECK(cudaMalloc(&d_recv, strip_bytes[1]));
+            NCCL_CHECK(ncclGroupStart());
+            NCCL_CHECK(ncclSend(d_rgb[1], strip_bytes[1], ncclUint8, 0, comms[1], streams[1]));  // rank 1 sends its strip to rank 0
+            NCCL_CHECK(ncclRecv(d_recv,   strip_bytes[1], ncclUint8, 1, comms[0], streams[0]));  // rank 0 receives it
+            NCCL_CHECK(ncclGroupEnd());
+        }
+
+        // rank 0 copies its own strip and then the received one into the host
+        // image, top band first; the blocking copies wait for streams[0]
+        CUDA_CHECK(cudaSetDevice(0));
+        CUDA_CHECK(cudaMemcpy(rgb->data(), d_rgb[0], strip_bytes[0], cudaMemcpyDeviceToHost));
+        if (n > 1) {
+            CUDA_CHECK(cudaMemcpy(rgb->data() + strip_bytes[0], d_recv, strip_bytes[1], cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaFree(d_recv));
+        }
+
+        for (int r = 0; r < n; r++) {
+            CUDA_CHECK(cudaSetDevice(r));
+            CUDA_CHECK(cudaFree(d_rgb[r]));
         }
     }
 

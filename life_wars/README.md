@@ -14,8 +14,11 @@ neighbours.
   count by colour printed every 10 steps, then `cudaDeviceSynchronize()` to
   catch kernel faults.
 - **`downsample` kernel + `write_ppm`:** renders the final grid at 4 x 4 cells
-  per pixel and writes a 512 x 512 `frame.ppm`. Each band renders its own
-  strip on its own GPU; the host stitches the strips together.
+  per pixel and writes a 512 x 512 `frame.ppm`. Each rank shrinks its own
+  band on its own GPU. Rank 1's strip reaches rank 0 through one more
+  `ncclSend`/`ncclRecv` pair in a group, queued behind the `downsample`
+  kernels on the same streams. Rank 0 then copies its own strip and the
+  received one into the host image, top band first, and writes the file.
 - **Bands, one per GPU:** `--gpus N` (1 or 2) splits the grid into `n`
   horizontal bands, band `r` on GPU `r`. Band `r` owns `rows[r]` rows starting
   at `row0[r]` and has its own `cur`/`nxt` buffers with a halo row above and
