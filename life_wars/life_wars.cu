@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <nccl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -146,6 +147,14 @@ static std::vector<uint8_t> simulate(const std::vector<uint8_t>& init, int n, in
                               (size_t)rows[r] * W, cudaMemcpyHostToDevice));
     }
 
+    // one NCCL communicator per GPU, all in this process: ncclCommInitAll
+    // sets up comms[i] on devs[i]. Only needed when there are two bands to talk.
+    ncclComm_t comms[2] = {nullptr, nullptr};
+    if (n > 1) {
+        int devs[2] = {0, 1};
+        NCCL_CHECK(ncclCommInitAll(comms, 2, devs));
+    }
+
     // copy every band's owned rows (not the halos) back into one host grid
     std::vector<uint8_t> grid(init.size());
     auto gather = [&]() {
@@ -238,6 +247,10 @@ static std::vector<uint8_t> simulate(const std::vector<uint8_t>& init, int n, in
         CUDA_CHECK(cudaFree(cur[r]));
         CUDA_CHECK(cudaFree(nxt[r]));
         CUDA_CHECK(cudaStreamDestroy(streams[r]));
+    }
+    if (n > 1) {
+        for (int r = 0; r < n; r++)
+            NCCL_CHECK(ncclCommDestroy(comms[r]));
     }
     return grid;
 }
