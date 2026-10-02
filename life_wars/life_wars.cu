@@ -91,6 +91,50 @@ __global__ void count_cells(const uint8_t* __restrict__ cur, int rows, int colum
     }
 }
 
+// How many grid rows per second GPU `dev` can step: run life_step on a
+// 1024-row slab 40 times and time it with events. --balance uses the ratio
+// of the two GPUs' rates to split the grid so both finish a step together.
+static double rows_per_sec(int dev, int columns) {
+    const int slab = 1024, reps = 40;
+    CUDA_CHECK(cudaSetDevice(dev));
+
+    size_t bytes = (size_t)(slab + 2) * columns;  // halo row above and below, as in the real bands
+    uint8_t *a = nullptr, *b = nullptr;
+    CUDA_CHECK(cudaMalloc(&a, bytes));
+    CUDA_CHECK(cudaMalloc(&b, bytes));
+    CUDA_CHECK(cudaMemset(a, 0, bytes));
+    CUDA_CHECK(cudaMemset(b, 0, bytes));
+
+    dim3 block(32, 8);
+    dim3 g((columns + block.x - 1) / block.x, (slab + block.y - 1) / block.y);
+
+    cudaEvent_t t0 = nullptr, t1 = nullptr;
+    CUDA_CHECK(cudaEventCreate(&t0));
+    CUDA_CHECK(cudaEventCreate(&t1));
+
+    // the first launch on a device also pays for loading the kernel; keep it out of the timing
+    life_step<<<g, block, 0, 0>>>(a, b, slab, columns);
+    CUDA_CHECK(cudaGetLastError());
+
+    CUDA_CHECK(cudaEventRecord(t0, 0));
+    for (int i = 0; i < reps; i++) {
+        life_step<<<g, block, 0, 0>>>(a, b, slab, columns);
+        std::swap(a, b);
+    }
+    CUDA_CHECK(cudaEventRecord(t1, 0));
+    CUDA_CHECK(cudaEventSynchronize(t1));
+    CUDA_CHECK(cudaGetLastError());
+
+    float ms = 0;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, t0, t1));
+
+    CUDA_CHECK(cudaEventDestroy(t0));
+    CUDA_CHECK(cudaEventDestroy(t1));
+    CUDA_CHECK(cudaFree(a));
+    CUDA_CHECK(cudaFree(b));
+    return (double)slab * reps / (ms * 1e-3);
+}
+
 // Shrink the band by `shrink` in each direction into an RGB image: each output
 // pixel shows the colour that has more cells in its shrink x shrink block.
 // With `mark` set (--mark-bands) the first pixel row of every band after the
@@ -170,13 +214,30 @@ static void write_ppm(const std::string& path, const uint8_t* rgb, int w, int h)
 // `frame_every` > 0 the grid is also rendered at step 0 and after every
 // frame_every-th step, each frame going to FRAMES_DIR/frame_NNNNN.ppm with a
 // running index, which is what make_video.sh expects. `mark_bands` makes the
-// strip each GPU rendered visible (see downsample).
-static std::vector<uint8_t> simulate(const std::vector<uint8_t>& init, int n, int steps, bool verbose, std::vector<uint8_t>* rgb, int frame_every, bool mark_bands, int shrink) {
-    // band r owns grid rows [row0[r], row0[r] + rows[r])
+// strip each GPU rendered visible (see downsample). `balance` splits the rows
+// in proportion to each GPU's measured speed instead of equally.
+static std::vector<uint8_t> simulate(const std::vector<uint8_t>& init, int n, int steps, bool verbose, std::vector<uint8_t>* rgb, int frame_every, bool mark_bands, int shrink, bool balance) {
+    // band r owns grid rows [row0[r], row0[r] + rows[r]); equal split by default
     int rows[2] = {0, 0}, row0[2] = {0, 0};
     for (int r = 0; r < n; r++) {
         rows[r] = H / n + (r < H % n ? 1 : 0);
         row0[r] = (r == 0) ? 0 : row0[r - 1] + rows[r - 1];
+    }
+
+    // --balance: give each GPU rows in proportion to its rate, so the faster
+    // one does not wait for the slower one every step. rows[0] is rounded
+    // down to a multiple of shrink so both strips still render whole pixels.
+    if (balance && n > 1) {
+        double r0 = rows_per_sec(0, W), r1 = rows_per_sec(1, W);
+        rows[0] = (int)(H * r0 / (r0 + r1));
+        rows[0] = rows[0] / shrink * shrink;
+        if (rows[0] < shrink) rows[0] = shrink;
+        if (rows[0] > H - shrink) rows[0] = H - shrink;
+        rows[1] = H - rows[0];
+        row0[1] = rows[0];
+        if (verbose)
+            printf("balance: GPU 0 %.2f Mrows/s, GPU 1 %.2f Mrows/s -> rows %d + %d\n",
+                   r0 / 1e6, r1 / 1e6, rows[0], rows[1]);
     }
 
     // two buffers per band on its own GPU: the kernel reads cur and writes nxt,
@@ -443,7 +504,7 @@ static std::vector<uint8_t> simulate(const std::vector<uint8_t>& init, int n, in
 
 static void usage(const char* prog) {
     fprintf(stderr,
-            "usage: %s [--gpus N] [--steps N] [--seed N] [--frame-every N] [--mark-bands] [--full-size] [--check]\n"
+            "usage: %s [--gpus N] [--steps N] [--seed N] [--frame-every N] [--mark-bands] [--full-size] [--balance] [--check]\n"
             "  --gpus N         number of GPUs, 1 or 2; the grid is split into one band per GPU\n"
             "  --steps N        generations to run (default 100)\n"
             "  --seed N         seed for the random soup (default 1)\n"
@@ -451,6 +512,8 @@ static void usage(const char* prog) {
             "                   to %s/frame_00000.ppm, frame_00001.ppm, ... (default off)\n"
             "  --mark-bands     draw a yellow seam line where the GPUs' bands meet\n"
             "  --full-size      write images at one cell per pixel instead of %d x %d cells per pixel\n"
+            "  --balance        with --gpus 2, time each GPU on a 1024-row slab first and split\n"
+            "                   the rows in proportion instead of equally\n"
             "  --check          with --gpus 2, also run one band and compare the grids\n",
             prog, FRAMES_DIR, SHRINK, SHRINK);
     exit(2);
@@ -463,6 +526,7 @@ int main(int argc, char** argv) {
     int frame_every = 0;  // 0: only the final frame.ppm
     bool mark_bands = false;
     bool full_size = false;
+    bool balance = false;
     bool check = false;
 
     for (int i = 1; i < argc; i++) {
@@ -479,6 +543,8 @@ int main(int argc, char** argv) {
             mark_bands = true;
         else if (a == "--full-size")
             full_size = true;
+        else if (a == "--balance")
+            balance = true;
         else if (a == "--check")
             check = true;
         else
@@ -517,7 +583,7 @@ int main(int argc, char** argv) {
 
     std::vector<uint8_t> rgb;
     const int shrink = full_size ? 1 : SHRINK;
-    std::vector<uint8_t> grid = simulate(soup, n, steps, true, &rgb, frame_every, mark_bands, shrink);
+    std::vector<uint8_t> grid = simulate(soup, n, steps, true, &rgb, frame_every, mark_bands, shrink, balance);
 
     int live = 0;
     for (uint8_t v : grid)
@@ -535,7 +601,7 @@ int main(int argc, char** argv) {
         if (n == 1) {
             printf("check: only one band, nothing to compare against\n");
         } else {
-            std::vector<uint8_t> ref = simulate(soup, 1, steps, false, nullptr, 0, false, shrink);
+            std::vector<uint8_t> ref = simulate(soup, 1, steps, false, nullptr, 0, false, shrink, false);
             if (memcmp(grid.data(), ref.data(), grid.size()) == 0) {
                 printf("check: %d-band grid identical to 1-band grid after %d steps\n", n, steps);
             } else {

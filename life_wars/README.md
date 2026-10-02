@@ -67,6 +67,11 @@ neighbours.
   finishes its half later than the RTX 5070 Ti, and every step waits for both.
   The per-10-step count readback and `--frame-every` stall the host, so turn
   them off when comparing numbers.
+- **`--balance`:** `rows_per_sec(dev, W)` runs `life_step` on a 1024-row slab
+  40 times on each GPU and times it with events (after one untimed warm-up
+  launch). The grid is then split in proportion, `rows[0] = H * r0 / (r0 +
+  r1)`, rounded down to a multiple of the shrink factor so both strips still
+  render whole pixels. The measured rates and the split are printed.
 - **`--check`:** with `--gpus 2`, also runs the same soup as one band and
   `memcmp`s the two final grids. A mismatch prints the first differing cell and
   exits 1; a halo index bug shows up here, before NCCL enters the picture.
