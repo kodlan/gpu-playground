@@ -93,7 +93,9 @@ __global__ void count_cells(const uint8_t* __restrict__ cur, int rows, int colum
 
 // Shrink the band by `shrink` in each direction into an RGB image: each output
 // pixel shows the colour that has more cells in its shrink x shrink block.
-__global__ void downsample(const uint8_t* __restrict__ cur, int rows, int colums, int shrink, uint8_t* rgb, int out_w) {
+// `band` picks the background shade for empty blocks, so the strip rendered
+// by each GPU can be told apart: band 0 near black, band 1 a lighter grey.
+__global__ void downsample(const uint8_t* __restrict__ cur, int rows, int colums, int shrink, uint8_t* rgb, int out_w, int band) {
     int ox = blockIdx.x * blockDim.x + threadIdx.x;
     int oy = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -127,7 +129,8 @@ __global__ void downsample(const uint8_t* __restrict__ cur, int rows, int colums
     } else if (red) {
         p[0] = p[1] = p[2] = 30 + level * 100 / 255;
     } else {
-        p[0] = p[1] = p[2] = 8;
+        // empty block: the band's background shade marks which GPU drew it
+        p[0] = p[1] = p[2] = band ? 22 : 6;
     }
 }
 
@@ -245,7 +248,7 @@ static std::vector<uint8_t> simulate(const std::vector<uint8_t>& init, int n, in
             CUDA_CHECK(cudaSetDevice(r));
             int band_h = rows[r] / SHRINK;
             dim3 og((out_w + block.x - 1) / block.x, (band_h + block.y - 1) / block.y);
-            downsample<<<og, block, 0, streams[r]>>>(cur[r], rows[r], W, SHRINK, d_rgb[r], out_w);
+            downsample<<<og, block, 0, streams[r]>>>(cur[r], rows[r], W, SHRINK, d_rgb[r], out_w, r);
             CUDA_CHECK(cudaGetLastError());
         }
 
