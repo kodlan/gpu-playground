@@ -93,9 +93,10 @@ __global__ void count_cells(const uint8_t* __restrict__ cur, int rows, int colum
 
 // Shrink the band by `shrink` in each direction into an RGB image: each output
 // pixel shows the colour that has more cells in its shrink x shrink block.
-// `band` picks the background shade for empty blocks, so the strip rendered
-// by each GPU can be told apart: band 0 near black, band 1 a lighter grey.
-__global__ void downsample(const uint8_t* __restrict__ cur, int rows, int colums, int shrink, uint8_t* rgb, int out_w, int band) {
+// With `mark` set (--mark-bands) the strip each GPU drew is made obvious:
+// band 1's empty blocks get a clearly lighter grey background than band 0's,
+// and the first pixel row of every band after the first is a yellow seam line.
+__global__ void downsample(const uint8_t* __restrict__ cur, int rows, int colums, int shrink, uint8_t* rgb, int out_w, int band, int mark) {
     int ox = blockIdx.x * blockDim.x + threadIdx.x;
     int oy = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -115,6 +116,14 @@ __global__ void downsample(const uint8_t* __restrict__ cur, int rows, int colums
     uint8_t* p = rgb + (oy * out_w + ox) * 3;
     int total = shrink * shrink;
 
+    // seam line: the first pixel row of band 1 (and later bands)
+    if (mark && band > 0 && oy == 0) {
+        p[0] = 230;
+        p[1] = 200;
+        p[2] = 40;
+        return;
+    }
+
     // brightness = how full the block is; hue = which colour dominates
     int level = (red + blue) * 255 / total;
 
@@ -129,8 +138,8 @@ __global__ void downsample(const uint8_t* __restrict__ cur, int rows, int colums
     } else if (red) {
         p[0] = p[1] = p[2] = 30 + level * 100 / 255;
     } else {
-        // empty block: the band's background shade marks which GPU drew it
-        p[0] = p[1] = p[2] = band ? 22 : 6;
+        // empty block: with --mark-bands the background shade says which GPU drew it
+        p[0] = p[1] = p[2] = (mark && band) ? 70 : 8;
     }
 }
 
@@ -162,8 +171,9 @@ static void write_ppm(const std::string& path, const uint8_t* rgb, int w, int h)
 // final grid is rendered into it at SHRINK x SHRINK cells per pixel. With
 // `frame_every` > 0 the grid is also rendered at step 0 and after every
 // frame_every-th step, each frame going to FRAMES_DIR/frame_NNNNN.ppm with a
-// running index, which is what make_video.sh expects.
-static std::vector<uint8_t> simulate(const std::vector<uint8_t>& init, int n, int steps, bool verbose, std::vector<uint8_t>* rgb, int frame_every) {
+// running index, which is what make_video.sh expects. `mark_bands` makes the
+// strip each GPU rendered visible (see downsample).
+static std::vector<uint8_t> simulate(const std::vector<uint8_t>& init, int n, int steps, bool verbose, std::vector<uint8_t>* rgb, int frame_every, bool mark_bands) {
     // band r owns grid rows [row0[r], row0[r] + rows[r])
     int rows[2] = {0, 0}, row0[2] = {0, 0};
     for (int r = 0; r < n; r++) {
@@ -248,7 +258,7 @@ static std::vector<uint8_t> simulate(const std::vector<uint8_t>& init, int n, in
             CUDA_CHECK(cudaSetDevice(r));
             int band_h = rows[r] / SHRINK;
             dim3 og((out_w + block.x - 1) / block.x, (band_h + block.y - 1) / block.y);
-            downsample<<<og, block, 0, streams[r]>>>(cur[r], rows[r], W, SHRINK, d_rgb[r], out_w, r);
+            downsample<<<og, block, 0, streams[r]>>>(cur[r], rows[r], W, SHRINK, d_rgb[r], out_w, r, mark_bands ? 1 : 0);
             CUDA_CHECK(cudaGetLastError());
         }
 
@@ -402,12 +412,14 @@ static std::vector<uint8_t> simulate(const std::vector<uint8_t>& init, int n, in
 
 static void usage(const char* prog) {
     fprintf(stderr,
-            "usage: %s [--gpus N] [--steps N] [--seed N] [--frame-every N] [--check]\n"
+            "usage: %s [--gpus N] [--steps N] [--seed N] [--frame-every N] [--mark-bands] [--check]\n"
             "  --gpus N         number of GPUs, 1 or 2; the grid is split into one band per GPU\n"
             "  --steps N        generations to run (default 100)\n"
             "  --seed N         seed for the random soup (default 1)\n"
             "  --frame-every N  also write a frame at step 0 and after every Nth step\n"
             "                   to %s/frame_00000.ppm, frame_00001.ppm, ... (default off)\n"
+            "  --mark-bands     show which GPU drew which strip: lighter background for\n"
+            "                   GPU 1's band and a yellow seam line where the bands meet\n"
             "  --check          with --gpus 2, also run one band and compare the grids\n",
             prog, FRAMES_DIR);
     exit(2);
@@ -418,6 +430,7 @@ int main(int argc, char** argv) {
     int steps = 100;
     unsigned seed = 1;
     int frame_every = 0;  // 0: only the final frame.ppm
+    bool mark_bands = false;
     bool check = false;
 
     for (int i = 1; i < argc; i++) {
@@ -430,6 +443,8 @@ int main(int argc, char** argv) {
             seed = (unsigned)strtoul(argv[++i], nullptr, 10);
         else if (a == "--frame-every" && i + 1 < argc)
             frame_every = atoi(argv[++i]);
+        else if (a == "--mark-bands")
+            mark_bands = true;
         else if (a == "--check")
             check = true;
         else
@@ -467,7 +482,7 @@ int main(int argc, char** argv) {
     printf("initial live cells: %d of %d (seed %u)\n", initial, H * W, seed);
 
     std::vector<uint8_t> rgb;
-    std::vector<uint8_t> grid = simulate(soup, n, steps, true, &rgb, frame_every);
+    std::vector<uint8_t> grid = simulate(soup, n, steps, true, &rgb, frame_every, mark_bands);
 
     int live = 0;
     for (uint8_t v : grid)
@@ -485,7 +500,7 @@ int main(int argc, char** argv) {
         if (n == 1) {
             printf("check: only one band, nothing to compare against\n");
         } else {
-            std::vector<uint8_t> ref = simulate(soup, 1, steps, false, nullptr, 0);
+            std::vector<uint8_t> ref = simulate(soup, 1, steps, false, nullptr, 0, false);
             if (memcmp(grid.data(), ref.data(), grid.size()) == 0) {
                 printf("check: %d-band grid identical to 1-band grid after %d steps\n", n, steps);
             } else {
