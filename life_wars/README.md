@@ -22,6 +22,10 @@ neighbours.
 - **`--mark-bands`:** draws the first pixel row of GPU 1's band as a yellow
   seam line, so the split between the GPUs' strips is visible in every frame.
   It covers one row of pixels, which is why it is off by default.
+- **`--full-size`:** writes `frame.ppm` and the `frames/` images at one cell
+  per pixel (2048 x 2048) instead of 4 x 4 cells per pixel. The same
+  `downsample` kernel runs with a shrink factor of 1, so a live cell is a
+  full-brightness red or blue pixel.
 - **Bands, one per GPU:** `--gpus N` (1 or 2) splits the grid into `n`
   horizontal bands, band `r` on GPU `r`. Band `r` owns `rows[r]` rows starting
   at `row0[r]` and has its own `cur`/`nxt` buffers with a halo row above and

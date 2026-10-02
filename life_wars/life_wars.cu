@@ -12,7 +12,7 @@
 #include "../common/check.h"
 
 static const int W = 2048, H = 2048;
-static const int SHRINK = 4;              // rendered frames: SHRINK x SHRINK cells per pixel
+static const int SHRINK = 4;              // rendered frames: SHRINK x SHRINK cells per pixel (1 with --full-size)
 static const char* FRAMES_DIR = "frames"; // --frame-every writes frames/frame_00000.ppm, ...
 
 
@@ -166,12 +166,12 @@ static void write_ppm(const std::string& path, const uint8_t* rgb, int w, int h)
 // run in order without the host waiting in between.
 //
 // `verbose` prints the live count every 10 steps; if `rgb` is given, the
-// final grid is rendered into it at SHRINK x SHRINK cells per pixel. With
+// final grid is rendered into it at shrink x shrink cells per pixel. With
 // `frame_every` > 0 the grid is also rendered at step 0 and after every
 // frame_every-th step, each frame going to FRAMES_DIR/frame_NNNNN.ppm with a
 // running index, which is what make_video.sh expects. `mark_bands` makes the
 // strip each GPU rendered visible (see downsample).
-static std::vector<uint8_t> simulate(const std::vector<uint8_t>& init, int n, int steps, bool verbose, std::vector<uint8_t>* rgb, int frame_every, bool mark_bands) {
+static std::vector<uint8_t> simulate(const std::vector<uint8_t>& init, int n, int steps, bool verbose, std::vector<uint8_t>* rgb, int frame_every, bool mark_bands, int shrink) {
     // band r owns grid rows [row0[r], row0[r] + rows[r])
     int rows[2] = {0, 0}, row0[2] = {0, 0};
     for (int r = 0; r < n; r++) {
@@ -228,19 +228,20 @@ static std::vector<uint8_t> simulate(const std::vector<uint8_t>& init, int n, in
     dim3 block(32, 8);
 
     // Rendering. Each rank shrinks its own band on its own GPU into a strip
-    // of out_w x (rows[r] / SHRINK) pixels, straight from the device buffer
+    // of out_w x (rows[r] / shrink) pixels, straight from the device buffer
     // (downsample skips the halo row itself, so pass cur, not cur + W).
-    // rows[r] is a multiple of SHRINK for H = 2048 and n <= 2. The strips and
-    // rank 0's receive buffer are allocated once and reused for every frame.
+    // rows[r] is a multiple of shrink for H = 2048, n <= 2 and shrink 1 or 4.
+    // The strips and rank 0's receive buffer are allocated once and reused
+    // for every frame.
     const bool rendering = (rgb != nullptr) || frame_every > 0;
-    const int out_w = W / SHRINK, out_h = H / SHRINK;
+    const int out_w = W / shrink, out_h = H / shrink;
     uint8_t* d_rgb[2] = {nullptr, nullptr};
     size_t strip_bytes[2] = {0, 0};
     uint8_t* d_recv = nullptr;  // rank 1's strip, landed on GPU 0
     if (rendering) {
         for (int r = 0; r < n; r++) {
             CUDA_CHECK(cudaSetDevice(r));
-            strip_bytes[r] = (size_t)out_w * (rows[r] / SHRINK) * 3;
+            strip_bytes[r] = (size_t)out_w * (rows[r] / shrink) * 3;
             CUDA_CHECK(cudaMalloc(&d_rgb[r], strip_bytes[r]));
         }
         if (n > 1) {
@@ -254,9 +255,9 @@ static std::vector<uint8_t> simulate(const std::vector<uint8_t>& init, int n, in
         out.resize((size_t)out_w * out_h * 3);
         for (int r = 0; r < n; r++) {
             CUDA_CHECK(cudaSetDevice(r));
-            int band_h = rows[r] / SHRINK;
+            int band_h = rows[r] / shrink;
             dim3 og((out_w + block.x - 1) / block.x, (band_h + block.y - 1) / block.y);
-            downsample<<<og, block, 0, streams[r]>>>(cur[r], rows[r], W, SHRINK, d_rgb[r], out_w, r, mark_bands ? 1 : 0);
+            downsample<<<og, block, 0, streams[r]>>>(cur[r], rows[r], W, shrink, d_rgb[r], out_w, r, mark_bands ? 1 : 0);
             CUDA_CHECK(cudaGetLastError());
         }
 
@@ -410,15 +411,16 @@ static std::vector<uint8_t> simulate(const std::vector<uint8_t>& init, int n, in
 
 static void usage(const char* prog) {
     fprintf(stderr,
-            "usage: %s [--gpus N] [--steps N] [--seed N] [--frame-every N] [--mark-bands] [--check]\n"
+            "usage: %s [--gpus N] [--steps N] [--seed N] [--frame-every N] [--mark-bands] [--full-size] [--check]\n"
             "  --gpus N         number of GPUs, 1 or 2; the grid is split into one band per GPU\n"
             "  --steps N        generations to run (default 100)\n"
             "  --seed N         seed for the random soup (default 1)\n"
             "  --frame-every N  also write a frame at step 0 and after every Nth step\n"
             "                   to %s/frame_00000.ppm, frame_00001.ppm, ... (default off)\n"
             "  --mark-bands     draw a yellow seam line where the GPUs' bands meet\n"
+            "  --full-size      write images at one cell per pixel instead of %d x %d cells per pixel\n"
             "  --check          with --gpus 2, also run one band and compare the grids\n",
-            prog, FRAMES_DIR);
+            prog, FRAMES_DIR, SHRINK, SHRINK);
     exit(2);
 }
 
@@ -428,6 +430,7 @@ int main(int argc, char** argv) {
     unsigned seed = 1;
     int frame_every = 0;  // 0: only the final frame.ppm
     bool mark_bands = false;
+    bool full_size = false;
     bool check = false;
 
     for (int i = 1; i < argc; i++) {
@@ -442,6 +445,8 @@ int main(int argc, char** argv) {
             frame_every = atoi(argv[++i]);
         else if (a == "--mark-bands")
             mark_bands = true;
+        else if (a == "--full-size")
+            full_size = true;
         else if (a == "--check")
             check = true;
         else
@@ -479,14 +484,15 @@ int main(int argc, char** argv) {
     printf("initial live cells: %d of %d (seed %u)\n", initial, H * W, seed);
 
     std::vector<uint8_t> rgb;
-    std::vector<uint8_t> grid = simulate(soup, n, steps, true, &rgb, frame_every, mark_bands);
+    const int shrink = full_size ? 1 : SHRINK;
+    std::vector<uint8_t> grid = simulate(soup, n, steps, true, &rgb, frame_every, mark_bands, shrink);
 
     int live = 0;
     for (uint8_t v : grid)
         live += (v != 0);
     printf("live cells after %d steps: %d (%.2f%%)\n", steps, live, 100.0 * live / (H * W));
 
-    const int out_w = W / SHRINK, out_h = H / SHRINK;
+    const int out_w = W / shrink, out_h = H / shrink;
     write_ppm("frame.ppm", rgb.data(), out_w, out_h);
     printf("wrote frame.ppm (%dx%d)\n", out_w, out_h);
 
@@ -497,7 +503,7 @@ int main(int argc, char** argv) {
         if (n == 1) {
             printf("check: only one band, nothing to compare against\n");
         } else {
-            std::vector<uint8_t> ref = simulate(soup, 1, steps, false, nullptr, 0, false);
+            std::vector<uint8_t> ref = simulate(soup, 1, steps, false, nullptr, 0, false, shrink);
             if (memcmp(grid.data(), ref.data(), grid.size()) == 0) {
                 printf("check: %d-band grid identical to 1-band grid after %d steps\n", n, steps);
             } else {
