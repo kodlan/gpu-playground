@@ -174,16 +174,25 @@ static std::vector<uint8_t> simulate(const std::vector<uint8_t>& init, int n, in
         // they must hold the neighbour's current edge row when it runs. The
         // first step would otherwise see empty halos and the bands drift apart.
         //
-        // cudaMemcpyPeer(dst, dst device, src, src device, bytes) copies
-        // between GPUs; without peer-to-peer access the driver stages it
-        // through host memory. It is ordered after all pending work on both
-        // devices and before everything queued after it, so the previous
-        // step's kernels are done when it reads, and this step's wait for it.
+        // Each line reads "rank X sends/receives W bytes to/from rank Y on its
+        // stream"; the pointer says where the bytes come from or go to.
+        //
+        // Why the group: this one thread issues all four calls. Without it the
+        // first ncclSend could wait for rank 1's matching ncclRecv, which this
+        // thread has not issued yet, and the program would hang forever. The
+        // group tells NCCL "collect these, then start them all together".
+        //
+        // Why no synchronisation before the kernel: the receive is queued on
+        // streams[r] and the kernel is queued on the same stream right after
+        // it. The GPU runs stream work in order, so the kernel starts only
+        // when the halo has arrived.
         if (n > 1) {
-            // band 0's last owned row (GPU 0) -> band 1's top halo row (GPU 1, row 0 of its buffer)
-            CUDA_CHECK(cudaMemcpyPeer(cur[1], 1, cur[0] + (size_t)rows[0] * W, 0, W));
-            // band 1's first owned row (GPU 1) -> band 0's bottom halo row (GPU 0, row rows[0] + 1)
-            CUDA_CHECK(cudaMemcpyPeer(cur[0] + (size_t)(rows[0] + 1) * W, 0, cur[1] + W, 1, W));
+            NCCL_CHECK(ncclGroupStart());
+            NCCL_CHECK(ncclSend(cur[0] + (size_t)rows[0] * W,       W, ncclUint8, 1, comms[0], streams[0]));  // rank 0's last owned row
+            NCCL_CHECK(ncclRecv(cur[0] + (size_t)(rows[0] + 1) * W, W, ncclUint8, 1, comms[0], streams[0]));  // into rank 0's bottom halo
+            NCCL_CHECK(ncclSend(cur[1] + W,                         W, ncclUint8, 0, comms[1], streams[1]));  // rank 1's first owned row
+            NCCL_CHECK(ncclRecv(cur[1],                             W, ncclUint8, 0, comms[1], streams[1]));  // into rank 1's top halo
+            NCCL_CHECK(ncclGroupEnd());
         }
 
         for (int r = 0; r < n; r++) {

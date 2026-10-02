@@ -23,12 +23,19 @@ neighbours.
   kernels launch on `streams[r]`, one stream per GPU. The stream is not for
   overlap: NCCL calls take a stream, so the kernel and the NCCL work for one
   GPU go into the same queue and run in order without the host waiting.
-- **Halo exchange:** before every step, `cudaMemcpyPeer` copies band 0's last
-  row (GPU 0) into band 1's top halo (GPU 1) and band 1's first row into band
-  0's bottom halo. Without peer-to-peer access the driver stages the copy
-  through host memory. The kernel reads the halos, so copying after the step
-  would leave the first step blind. Everything two-GPU is behind `if (n > 1)`;
-  with `--gpus 1` it is the single-buffer program as before.
+- **NCCL:** `ncclCommInitAll` makes one communicator per GPU, rank `r` on
+  GPU `r`, after the buffers are allocated; both are destroyed at the end.
+- **Halo exchange:** before every step, a `ncclGroupStart`/`ncclGroupEnd`
+  group holds four calls: rank 0 sends its last owned row to rank 1 and
+  receives into its bottom halo; rank 1 sends its first owned row to rank 0
+  and receives into its top halo. Each call goes on that rank's stream. The
+  group matters because one host thread issues all four: outside a group the
+  first send could wait for a receive the thread has not issued yet and hang.
+  No synchronisation is needed before the kernel: the receive and the kernel
+  sit on the same stream, and the GPU runs stream work in order, so the kernel
+  starts only when the halo has arrived. Copying after the step instead would
+  leave the first step blind. Everything two-GPU is behind `if (n > 1)`; with
+  `--gpus 1` it is the single-buffer program as before.
 - **`--check`:** with `--gpus 2`, also runs the same soup as one band and
   `memcmp`s the two final grids. A mismatch prints the first differing cell and
   exits 1; a halo index bug shows up here, before NCCL enters the picture.
