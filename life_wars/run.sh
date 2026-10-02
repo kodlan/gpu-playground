@@ -2,4 +2,4 @@
 
 set -euo pipefail
 
-./life_wars
+./life_wars --gpus 1

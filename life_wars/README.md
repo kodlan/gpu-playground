@@ -15,13 +15,26 @@ neighbours.
   catch kernel faults.
 - **`downsample` kernel + `write_ppm`:** renders the final grid at 4 x 4 cells
   per pixel and writes a 128 x 128 `frame.ppm`.
+- **Bands:** `--gpus N` (1 or 2) splits the grid into `n` horizontal bands,
+  all still on GPU 0. Band `r` owns `rows[r]` rows starting at `row0[r]` and
+  has its own `cur`/`nxt` buffers with a halo row above and below. Before every
+  step, `cudaMemcpy` device-to-device copies band 0's last row into band 1's
+  top halo and band 1's first row into band 0's bottom halo; the kernel reads
+  the halos, so copying after the step would leave the first step blind.
+  Everything two-band is behind `if (n > 1)`; with `--gpus 1` it is the
+  single-buffer program as before.
+- **`--check`:** with `--gpus 2`, also runs the same soup as one band and
+  `memcmp`s the two final grids. A mismatch prints the first differing cell and
+  exits 1; a halo index bug shows up here, before NCCL enters the picture.
 
 ## Build and run
 
 Needs `nvcc` and an NVIDIA GPU.
 
 ```sh
-make run
+make run                          # runs ./life_wars --gpus 1
+./life_wars --gpus 2 --check      # two bands, verified against one band
+./life_wars --seed 7 --steps 250  # other soups and lengths
 ```
 
 A 30% soup should settle to a few percent alive within 100 steps.
