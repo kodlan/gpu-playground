@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <sys/stat.h>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -10,6 +12,8 @@
 #include "../common/check.h"
 
 static const int W = 2048, H = 2048;
+static const int SHRINK = 4;              // rendered frames: SHRINK x SHRINK cells per pixel
+static const char* FRAMES_DIR = "frames"; // --frame-every writes frames/frame_00000.ppm, ...
 
 
 __global__ void life_step(const uint8_t* cur, uint8_t* next, int rows, int columns) {
@@ -152,8 +156,11 @@ static void write_ppm(const std::string& path, const uint8_t* rgb, int w, int h)
 // run in order without the host waiting in between.
 //
 // `verbose` prints the live count every 10 steps; if `rgb` is given, the
-// final grid is rendered into it at 4 x 4 cells per pixel.
-static std::vector<uint8_t> simulate(const std::vector<uint8_t>& init, int n, int steps, bool verbose, std::vector<uint8_t>* rgb) {
+// final grid is rendered into it at SHRINK x SHRINK cells per pixel. With
+// `frame_every` > 0 the grid is also rendered at step 0 and after every
+// frame_every-th step, each frame going to FRAMES_DIR/frame_NNNNN.ppm with a
+// running index, which is what make_video.sh expects.
+static std::vector<uint8_t> simulate(const std::vector<uint8_t>& init, int n, int steps, bool verbose, std::vector<uint8_t>* rgb, int frame_every) {
     // band r owns grid rows [row0[r], row0[r] + rows[r])
     int rows[2] = {0, 0}, row0[2] = {0, 0};
     for (int r = 0; r < n; r++) {
@@ -208,6 +215,77 @@ static std::vector<uint8_t> simulate(const std::vector<uint8_t>& init, int n, in
     // blocks of 32 * 8 threads, enough to cover every cell of the band;
     // the bounds guard in the kernel eats the extra threads
     dim3 block(32, 8);
+
+    // Rendering. Each rank shrinks its own band on its own GPU into a strip
+    // of out_w x (rows[r] / SHRINK) pixels, straight from the device buffer
+    // (downsample skips the halo row itself, so pass cur, not cur + W).
+    // rows[r] is a multiple of SHRINK for H = 2048 and n <= 2. The strips and
+    // rank 0's receive buffer are allocated once and reused for every frame.
+    const bool rendering = (rgb != nullptr) || frame_every > 0;
+    const int out_w = W / SHRINK, out_h = H / SHRINK;
+    uint8_t* d_rgb[2] = {nullptr, nullptr};
+    size_t strip_bytes[2] = {0, 0};
+    uint8_t* d_recv = nullptr;  // rank 1's strip, landed on GPU 0
+    if (rendering) {
+        for (int r = 0; r < n; r++) {
+            CUDA_CHECK(cudaSetDevice(r));
+            strip_bytes[r] = (size_t)out_w * (rows[r] / SHRINK) * 3;
+            CUDA_CHECK(cudaMalloc(&d_rgb[r], strip_bytes[r]));
+        }
+        if (n > 1) {
+            CUDA_CHECK(cudaSetDevice(0));
+            CUDA_CHECK(cudaMalloc(&d_recv, strip_bytes[1]));
+        }
+    }
+
+    // render the current grid into the host image `out`
+    auto render = [&](std::vector<uint8_t>& out) {
+        out.resize((size_t)out_w * out_h * 3);
+        for (int r = 0; r < n; r++) {
+            CUDA_CHECK(cudaSetDevice(r));
+            int band_h = rows[r] / SHRINK;
+            dim3 og((out_w + block.x - 1) / block.x, (band_h + block.y - 1) / block.y);
+            downsample<<<og, block, 0, streams[r]>>>(cur[r], rows[r], W, SHRINK, d_rgb[r], out_w);
+            CUDA_CHECK(cudaGetLastError());
+        }
+
+        // Rank 1's small image has to reach rank 0, which writes the file:
+        // one more send/recv pair in a group. Both calls sit behind the
+        // downsample kernels on their streams, so the strips are finished
+        // when the bytes move.
+        if (n > 1) {
+            NCCL_CHECK(ncclGroupStart());
+            NCCL_CHECK(ncclSend(d_rgb[1], strip_bytes[1], ncclUint8, 0, comms[1], streams[1]));  // rank 1 sends its strip to rank 0
+            NCCL_CHECK(ncclRecv(d_recv,   strip_bytes[1], ncclUint8, 1, comms[0], streams[0]));  // rank 0 receives it
+            NCCL_CHECK(ncclGroupEnd());
+        }
+
+        // rank 0 copies its own strip and then the received one into the host
+        // image, top band first; the blocking copies wait for streams[0]
+        CUDA_CHECK(cudaSetDevice(0));
+        CUDA_CHECK(cudaMemcpy(out.data(), d_rgb[0], strip_bytes[0], cudaMemcpyDeviceToHost));
+        if (n > 1)
+            CUDA_CHECK(cudaMemcpy(out.data() + strip_bytes[0], d_recv, strip_bytes[1], cudaMemcpyDeviceToHost));
+    };
+
+    // frames/frame_00000.ppm, frame_00001.ppm, ... numbered by frame, not by
+    // step, so the sequence has no gaps for ffmpeg
+    int frames_written = 0;
+    std::vector<uint8_t> frame;
+    auto write_frame = [&]() {
+        render(frame);
+        char path[64];
+        snprintf(path, sizeof path, "%s/frame_%05d.ppm", FRAMES_DIR, frames_written);
+        write_ppm(path, frame.data(), out_w, out_h);
+        frames_written++;
+    };
+    if (frame_every > 0) {
+        if (mkdir(FRAMES_DIR, 0755) != 0 && errno != EEXIST) {
+            perror(FRAMES_DIR);
+            exit(1);
+        }
+        write_frame();  // step 0: the soup
+    }
 
     for (int s = 0; s < steps; s++) {
         // Halo exchange BEFORE the step: the kernel reads the halo rows, so
@@ -272,6 +350,12 @@ static std::vector<uint8_t> simulate(const std::vector<uint8_t>& init, int n, in
             CUDA_CHECK(cudaStreamSynchronize(streams[0]));
             printf("step %3d: live %7llu (red %7llu, blue %7llu)\n", s + 1, counts[0] + counts[1], counts[0], counts[1]);
         }
+
+        // every frame_every-th step goes to a file. The downsample kernels
+        // queue behind the step kernels on the same streams, so this sees the
+        // finished step; the copy to the host stalls, so drop it when timing.
+        if (frame_every > 0 && (s + 1) % frame_every == 0)
+            write_frame();
     }
     for (int r = 0; r < n; r++) {
         CUDA_CHECK(cudaSetDevice(r));
@@ -282,54 +366,20 @@ static std::vector<uint8_t> simulate(const std::vector<uint8_t>& init, int n, in
 
     gather();
 
-    if (rgb) {
-        // Each rank shrinks its own band on its own GPU, straight from the
-        // device buffer (downsample skips the halo row itself, so pass cur,
-        // not cur + W). Band r's strip is out_w x (rows[r] / shrink) pixels;
-        // rows[r] is a multiple of shrink for H = 2048 and n <= 2.
-        const int shrink = 4;
-        const int out_w = W / shrink, out_h = H / shrink;
-        rgb->resize((size_t)out_w * out_h * 3);
+    if (rgb)
+        render(*rgb);
+    if (frame_every > 0)
+        printf("wrote %d frames to %s/frame_%05d.ppm .. frame_%05d.ppm (%dx%d)\n",
+               frames_written, FRAMES_DIR, 0, frames_written - 1, out_w, out_h);
 
-        uint8_t* d_rgb[2] = {nullptr, nullptr};
-        size_t strip_bytes[2] = {0, 0};
-        for (int r = 0; r < n; r++) {
-            CUDA_CHECK(cudaSetDevice(r));
-            int band_h = rows[r] / shrink;
-            strip_bytes[r] = (size_t)out_w * band_h * 3;
-            CUDA_CHECK(cudaMalloc(&d_rgb[r], strip_bytes[r]));
-
-            dim3 og((out_w + block.x - 1) / block.x, (band_h + block.y - 1) / block.y);
-            downsample<<<og, block, 0, streams[r]>>>(cur[r], rows[r], W, shrink, d_rgb[r], out_w);
-            CUDA_CHECK(cudaGetLastError());
-        }
-
-        // Rank 1's small image has to reach rank 0, which writes the file:
-        // one more send/recv pair in a group. Both calls sit behind the
-        // downsample kernels on their streams, so the strips are finished
-        // when the bytes move.
-        uint8_t* d_recv = nullptr;  // rank 1's strip, landed on GPU 0
-        if (n > 1) {
-            CUDA_CHECK(cudaSetDevice(0));
-            CUDA_CHECK(cudaMalloc(&d_recv, strip_bytes[1]));
-            NCCL_CHECK(ncclGroupStart());
-            NCCL_CHECK(ncclSend(d_rgb[1], strip_bytes[1], ncclUint8, 0, comms[1], streams[1]));  // rank 1 sends its strip to rank 0
-            NCCL_CHECK(ncclRecv(d_recv,   strip_bytes[1], ncclUint8, 1, comms[0], streams[0]));  // rank 0 receives it
-            NCCL_CHECK(ncclGroupEnd());
-        }
-
-        // rank 0 copies its own strip and then the received one into the host
-        // image, top band first; the blocking copies wait for streams[0]
-        CUDA_CHECK(cudaSetDevice(0));
-        CUDA_CHECK(cudaMemcpy(rgb->data(), d_rgb[0], strip_bytes[0], cudaMemcpyDeviceToHost));
-        if (n > 1) {
-            CUDA_CHECK(cudaMemcpy(rgb->data() + strip_bytes[0], d_recv, strip_bytes[1], cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaFree(d_recv));
-        }
-
+    if (rendering) {
         for (int r = 0; r < n; r++) {
             CUDA_CHECK(cudaSetDevice(r));
             CUDA_CHECK(cudaFree(d_rgb[r]));
+        }
+        if (n > 1) {
+            CUDA_CHECK(cudaSetDevice(0));
+            CUDA_CHECK(cudaFree(d_recv));
         }
     }
 
@@ -349,12 +399,14 @@ static std::vector<uint8_t> simulate(const std::vector<uint8_t>& init, int n, in
 
 static void usage(const char* prog) {
     fprintf(stderr,
-            "usage: %s [--gpus N] [--steps N] [--seed N] [--check]\n"
-            "  --gpus N   number of GPUs, 1 or 2; the grid is split into one band per GPU\n"
-            "  --steps N  generations to run (default 100)\n"
-            "  --seed N   seed for the random soup (default 1)\n"
-            "  --check    with --gpus 2, also run one band and compare the grids\n",
-            prog);
+            "usage: %s [--gpus N] [--steps N] [--seed N] [--frame-every N] [--check]\n"
+            "  --gpus N         number of GPUs, 1 or 2; the grid is split into one band per GPU\n"
+            "  --steps N        generations to run (default 100)\n"
+            "  --seed N         seed for the random soup (default 1)\n"
+            "  --frame-every N  also write a frame at step 0 and after every Nth step\n"
+            "                   to %s/frame_00000.ppm, frame_00001.ppm, ... (default off)\n"
+            "  --check          with --gpus 2, also run one band and compare the grids\n",
+            prog, FRAMES_DIR);
     exit(2);
 }
 
@@ -362,6 +414,7 @@ int main(int argc, char** argv) {
     int n = 1;          // number of GPUs, one band each
     int steps = 100;
     unsigned seed = 1;
+    int frame_every = 0;  // 0: only the final frame.ppm
     bool check = false;
 
     for (int i = 1; i < argc; i++) {
@@ -372,6 +425,8 @@ int main(int argc, char** argv) {
             steps = atoi(argv[++i]);
         else if (a == "--seed" && i + 1 < argc)
             seed = (unsigned)strtoul(argv[++i], nullptr, 10);
+        else if (a == "--frame-every" && i + 1 < argc)
+            frame_every = atoi(argv[++i]);
         else if (a == "--check")
             check = true;
         else
@@ -379,6 +434,10 @@ int main(int argc, char** argv) {
     }
     if (n < 1 || n > 2) {
         fprintf(stderr, "--gpus must be 1 or 2\n");
+        return 2;
+    }
+    if (frame_every < 0) {
+        fprintf(stderr, "--frame-every must be positive\n");
         return 2;
     }
 
@@ -405,14 +464,14 @@ int main(int argc, char** argv) {
     printf("initial live cells: %d of %d (seed %u)\n", initial, H * W, seed);
 
     std::vector<uint8_t> rgb;
-    std::vector<uint8_t> grid = simulate(soup, n, steps, true, &rgb);
+    std::vector<uint8_t> grid = simulate(soup, n, steps, true, &rgb, frame_every);
 
     int live = 0;
     for (uint8_t v : grid)
         live += (v != 0);
     printf("live cells after %d steps: %d (%.2f%%)\n", steps, live, 100.0 * live / (H * W));
 
-    const int out_w = W / 4, out_h = H / 4;
+    const int out_w = W / SHRINK, out_h = H / SHRINK;
     write_ppm("frame.ppm", rgb.data(), out_w, out_h);
     printf("wrote frame.ppm (%dx%d)\n", out_w, out_h);
 
@@ -423,7 +482,7 @@ int main(int argc, char** argv) {
         if (n == 1) {
             printf("check: only one band, nothing to compare against\n");
         } else {
-            std::vector<uint8_t> ref = simulate(soup, 1, steps, false, nullptr);
+            std::vector<uint8_t> ref = simulate(soup, 1, steps, false, nullptr, 0);
             if (memcmp(grid.data(), ref.data(), grid.size()) == 0) {
                 printf("check: %d-band grid identical to 1-band grid after %d steps\n", n, steps);
             } else {

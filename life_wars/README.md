@@ -46,6 +46,11 @@ neighbours.
   millions. `ncclAllReduce` with `ncclSum` then adds the two ranks' counters
   in place: every rank puts in its two numbers and every rank gets the same
   two totals back. The host reads rank 0's after a `cudaStreamSynchronize`.
+- **`--frame-every N`:** also renders the grid at step 0 and after every Nth
+  step, through the same per-rank downsample and send/recv path, into
+  `frames/frame_00000.ppm`, `frame_00001.ppm`, ... The index counts frames,
+  not steps, so the sequence has no gaps and `make_video.sh` can turn it into
+  an MP4 and a GIF. The folder is created if missing; `make clean` removes it.
 - **`--check`:** with `--gpus 2`, also runs the same soup as one band and
   `memcmp`s the two final grids. A mismatch prints the first differing cell and
   exits 1; a halo index bug shows up here, before NCCL enters the picture.
@@ -58,6 +63,7 @@ Needs `nvcc` and one or two NVIDIA GPUs.
 make run                          # runs ./life_wars --gpus 1
 ./life_wars --gpus 2 --check      # one band per GPU, verified against one band
 ./life_wars --seed 7 --steps 250  # other soups and lengths
+./life_wars --gpus 2 --steps 600 --frame-every 2 && ./make_video.sh   # frames/ -> life_wars.mp4
 ```
 
 A 30% soup should settle to a few percent alive within 100 steps.
