@@ -19,10 +19,9 @@ neighbours.
   `ncclSend`/`ncclRecv` pair in a group, queued behind the `downsample`
   kernels on the same streams. Rank 0 then copies its own strip and the
   received one into the host image, top band first, and writes the file.
-- **`--mark-bands`:** makes the split between the GPUs' strips visible in
-  every frame. GPU 1's band gets a clearly lighter grey background for empty
-  blocks, and the first pixel row of that band is a yellow seam line (it
-  covers one row of pixels, which is why this is off by default).
+- **`--mark-bands`:** draws the first pixel row of GPU 1's band as a yellow
+  seam line, so the split between the GPUs' strips is visible in every frame.
+  It covers one row of pixels, which is why it is off by default.
 - **Bands, one per GPU:** `--gpus N` (1 or 2) splits the grid into `n`
   horizontal bands, band `r` on GPU `r`. Band `r` owns `rows[r]` rows starting
   at `row0[r]` and has its own `cur`/`nxt` buffers with a halo row above and

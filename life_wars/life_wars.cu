@@ -93,9 +93,8 @@ __global__ void count_cells(const uint8_t* __restrict__ cur, int rows, int colum
 
 // Shrink the band by `shrink` in each direction into an RGB image: each output
 // pixel shows the colour that has more cells in its shrink x shrink block.
-// With `mark` set (--mark-bands) the strip each GPU drew is made obvious:
-// band 1's empty blocks get a clearly lighter grey background than band 0's,
-// and the first pixel row of every band after the first is a yellow seam line.
+// With `mark` set (--mark-bands) the first pixel row of every band after the
+// first is drawn as a yellow seam line, so the strip each GPU drew is visible.
 __global__ void downsample(const uint8_t* __restrict__ cur, int rows, int colums, int shrink, uint8_t* rgb, int out_w, int band, int mark) {
     int ox = blockIdx.x * blockDim.x + threadIdx.x;
     int oy = blockIdx.y * blockDim.y + threadIdx.y;
@@ -138,8 +137,7 @@ __global__ void downsample(const uint8_t* __restrict__ cur, int rows, int colums
     } else if (red) {
         p[0] = p[1] = p[2] = 30 + level * 100 / 255;
     } else {
-        // empty block: with --mark-bands the background shade says which GPU drew it
-        p[0] = p[1] = p[2] = (mark && band) ? 70 : 8;
+        p[0] = p[1] = p[2] = 8;
     }
 }
 
@@ -418,8 +416,7 @@ static void usage(const char* prog) {
             "  --seed N         seed for the random soup (default 1)\n"
             "  --frame-every N  also write a frame at step 0 and after every Nth step\n"
             "                   to %s/frame_00000.ppm, frame_00001.ppm, ... (default off)\n"
-            "  --mark-bands     show which GPU drew which strip: lighter background for\n"
-            "                   GPU 1's band and a yellow seam line where the bands meet\n"
+            "  --mark-bands     draw a yellow seam line where the GPUs' bands meet\n"
             "  --check          with --gpus 2, also run one band and compare the grids\n",
             prog, FRAMES_DIR);
     exit(2);
