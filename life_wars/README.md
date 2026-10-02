@@ -36,6 +36,13 @@ neighbours.
   starts only when the halo has arrived. Copying after the step instead would
   leave the first step blind. Everything two-GPU is behind `if (n > 1)`; with
   `--gpus 1` it is the single-buffer program as before.
+- **`count_cells` kernel + all-reduce:** every 10 steps each band counts its
+  red and blue cells into two 64-bit counters on its own GPU. A block tallies
+  in shared memory first, then one thread per block does the `atomicAdd` to
+  the global counters, so there are thousands of global atomics instead of
+  millions. `ncclAllReduce` with `ncclSum` then adds the two ranks' counters
+  in place: every rank puts in its two numbers and every rank gets the same
+  two totals back. The host reads rank 0's after a `cudaStreamSynchronize`.
 - **`--check`:** with `--gpus 2`, also runs the same soup as one band and
   `memcmp`s the two final grids. A mismatch prints the first differing cell and
   exits 1; a halo index bug shows up here, before NCCL enters the picture.

@@ -54,6 +54,39 @@ __global__ void life_step(const uint8_t* cur, uint8_t* next, int rows, int colum
     next[y * columns + c] = out;
 }
 
+// Count the band's red and blue cells into counts[0] and counts[1]. Each block
+// first tallies in shared memory (fast, on-chip), then one thread per block
+// adds the block's totals to the global counters with atomicAdd: hundreds of
+// atomic adds to global memory per call instead of millions.
+__global__ void count_cells(const uint8_t* __restrict__ cur, int rows, int columns, unsigned long long* counts) {
+    __shared__ int s_red, s_blue;
+    bool leader = (threadIdx.x == 0 && threadIdx.y == 0);
+
+    if (leader) {
+        s_red = 0;
+        s_blue = 0;
+    }
+    __syncthreads();
+
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    int r = blockIdx.y * blockDim.y + threadIdx.y;
+    if (c < columns && r < rows) {
+        uint8_t v = cur[(r + 1) * columns + c]; // +1 skips the top halo row
+        if (v == 1)
+            atomicAdd(&s_red, 1);
+        else if (v == 2)
+            atomicAdd(&s_blue, 1);
+    }
+    __syncthreads();
+
+    if (leader) {
+        if (s_red)
+            atomicAdd(&counts[0], (unsigned long long)s_red);
+        if (s_blue)
+            atomicAdd(&counts[1], (unsigned long long)s_blue);
+    }
+}
+
 // Shrink the band by `shrink` in each direction into an RGB image: each output
 // pixel shows the colour that has more cells in its shrink x shrink block.
 __global__ void downsample(const uint8_t* __restrict__ cur, int rows, int colums, int shrink, uint8_t* rgb, int out_w) {
@@ -147,6 +180,13 @@ static std::vector<uint8_t> simulate(const std::vector<uint8_t>& init, int n, in
                               (size_t)rows[r] * W, cudaMemcpyHostToDevice));
     }
 
+    // per-band counters: counts_d[r][0] red, counts_d[r][1] blue, on GPU r
+    unsigned long long* counts_d[2] = {nullptr, nullptr};
+    for (int r = 0; r < n; r++) {
+        CUDA_CHECK(cudaSetDevice(r));
+        CUDA_CHECK(cudaMalloc(&counts_d[r], 2 * sizeof(unsigned long long)));
+    }
+
     // one NCCL communicator per GPU, all in this process: ncclCommInitAll
     // sets up comms[i] on devs[i]. Only needed when there are two bands to talk.
     ncclComm_t comms[2] = {nullptr, nullptr};
@@ -202,16 +242,35 @@ static std::vector<uint8_t> simulate(const std::vector<uint8_t>& init, int n, in
             std::swap(cur[r], nxt[r]);
         }
 
-        // the blocking memcpy waits for the kernels, so this is for watching
-        // the population only; drop it when timing
+        // Population count. Each band counts its own cells on its stream,
+        // right behind the step kernel, so no host wait is needed in between.
         if (verbose && (s + 1) % 10 == 0) {
-            gather();
-            int red = 0, blue = 0;
-            for (uint8_t v : grid) {
-                red += (v == 1);
-                blue += (v == 2);
+            for (int r = 0; r < n; r++) {
+                CUDA_CHECK(cudaSetDevice(r));
+                CUDA_CHECK(cudaMemsetAsync(counts_d[r], 0, 2 * sizeof(unsigned long long), streams[r]));
+                dim3 g((W + block.x - 1) / block.x, (rows[r] + block.y - 1) / block.y);
+                count_cells<<<g, block, 0, streams[r]>>>(cur[r], rows[r], W, counts_d[r]);
             }
-            printf("step %3d: live %6d (red %6d, blue %6d)\n", s + 1, red + blue, red, blue);
+
+            // Sum across GPUs. All-reduce: every rank puts in its two counts,
+            // NCCL adds them up, and every rank gets the same two totals back.
+            // Same buffer for input and output, so the reduction is in place.
+            // One group again, because this thread issues both ranks' calls.
+            if (n > 1) {
+                NCCL_CHECK(ncclGroupStart());
+                for (int r = 0; r < n; r++)
+                    NCCL_CHECK(ncclAllReduce(counts_d[r], counts_d[r], 2, ncclUint64, ncclSum, comms[r], streams[r]));
+                NCCL_CHECK(ncclGroupEnd());
+            }
+
+            // every rank has the totals, so read rank 0's. The stream wait
+            // stalls the host, so this is for watching the population only;
+            // drop it when timing.
+            unsigned long long counts[2];
+            CUDA_CHECK(cudaSetDevice(0));
+            CUDA_CHECK(cudaMemcpyAsync(counts, counts_d[0], sizeof counts, cudaMemcpyDeviceToHost, streams[0]));
+            CUDA_CHECK(cudaStreamSynchronize(streams[0]));
+            printf("step %3d: live %7llu (red %7llu, blue %7llu)\n", s + 1, counts[0] + counts[1], counts[0], counts[1]);
         }
     }
     for (int r = 0; r < n; r++) {
@@ -255,6 +314,7 @@ static std::vector<uint8_t> simulate(const std::vector<uint8_t>& init, int n, in
         CUDA_CHECK(cudaSetDevice(r));
         CUDA_CHECK(cudaFree(cur[r]));
         CUDA_CHECK(cudaFree(nxt[r]));
+        CUDA_CHECK(cudaFree(counts_d[r]));
         CUDA_CHECK(cudaStreamDestroy(streams[r]));
     }
     if (n > 1) {
