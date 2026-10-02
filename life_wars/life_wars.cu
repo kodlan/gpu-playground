@@ -8,7 +8,7 @@
 #include <vector>
 #include "../common/check.h"
 
-static const int W = 512, H = 512;
+static const int W = 2048, H = 2048;
 
 
 __global__ void life_step(const uint8_t* cur, uint8_t* next, int rows, int columns) {
