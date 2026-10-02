@@ -299,6 +299,20 @@ static std::vector<uint8_t> simulate(const std::vector<uint8_t>& init, int n, in
         write_frame();  // step 0: the soup
     }
 
+    // Timing. A cudaEvent recorded on a stream marks the moment the stream
+    // gets there, so start/stop on streams[r] bracket everything GPU r did in
+    // the loop: its kernels AND the time it sat waiting for the other GPU's
+    // halo rows. now_sec() around the loop gives the host's wall time, which
+    // also includes the count readbacks and frame writes if those are on.
+    cudaEvent_t start[2] = {nullptr, nullptr}, stop[2] = {nullptr, nullptr};
+    for (int r = 0; r < n; r++) {
+        CUDA_CHECK(cudaSetDevice(r));
+        CUDA_CHECK(cudaEventCreate(&start[r]));
+        CUDA_CHECK(cudaEventCreate(&stop[r]));
+        CUDA_CHECK(cudaEventRecord(start[r], streams[r]));
+    }
+    double t0 = now_sec();
+
     for (int s = 0; s < steps; s++) {
         // Halo exchange BEFORE the step: the kernel reads the halo rows, so
         // they must hold the neighbour's current edge row when it runs. The
@@ -371,9 +385,27 @@ static std::vector<uint8_t> simulate(const std::vector<uint8_t>& init, int n, in
     }
     for (int r = 0; r < n; r++) {
         CUDA_CHECK(cudaSetDevice(r));
+        CUDA_CHECK(cudaEventRecord(stop[r], streams[r]));
         CUDA_CHECK(cudaGetLastError());
         // an out-of-bounds read in a kernel surfaces here, not at the launch
         CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    double wall = now_sec() - t0;
+
+    if (verbose) {
+        printf("timing: %d steps in %.1f ms wall, %.0f steps/s\n", steps, wall * 1e3, steps / wall);
+        for (int r = 0; r < n; r++) {
+            CUDA_CHECK(cudaSetDevice(r));
+            float ms = 0;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, start[r], stop[r]));
+            printf("  GPU %d stream: %.1f ms between the marks%s\n", r, ms,
+                   n > 1 ? " (includes waiting for the other GPU's halo rows)" : "");
+        }
+    }
+    for (int r = 0; r < n; r++) {
+        CUDA_CHECK(cudaSetDevice(r));
+        CUDA_CHECK(cudaEventDestroy(start[r]));
+        CUDA_CHECK(cudaEventDestroy(stop[r]));
     }
 
     gather();

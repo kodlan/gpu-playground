@@ -58,6 +58,15 @@ neighbours.
   `frames/frame_00000.ppm`, `frame_00001.ppm`, ... The index counts frames,
   not steps, so the sequence has no gaps and `make_video.sh` can turn it into
   an MP4 and a GIF. The folder is created if missing; `make clean` removes it.
+- **Timing:** a `cudaEvent` is recorded on each GPU's stream before and after
+  the step loop; `cudaEventElapsedTime` gives the milliseconds between the two
+  marks on that stream, which includes the time the stream spent waiting for
+  the other GPU's halo rows, not just its own kernels. `now_sec()` around the
+  loop gives host wall time, printed as steps per second. With an equal split
+  the two-GPU run is faster than one GPU but not twice as fast: the RTX 2070
+  finishes its half later than the RTX 5070 Ti, and every step waits for both.
+  The per-10-step count readback and `--frame-every` stall the host, so turn
+  them off when comparing numbers.
 - **`--check`:** with `--gpus 2`, also runs the same soup as one band and
   `memcmp`s the two final grids. A mismatch prints the first differing cell and
   exits 1; a halo index bug shows up here, before NCCL enters the picture.
