@@ -502,29 +502,41 @@ static std::vector<uint8_t> simulate(const std::vector<uint8_t>& init, int n, in
     return grid;
 }
 
-// The five-cell glider, as (row, col) offsets of the shape that travels
-// down-right (south-east) one cell every four generations:
-//   . X .
-//   . . X
-//   X X X
-// Flipped top-to-bottom it travels up-right instead.
-static const int GLIDER[5][2] = {{0, 1}, {1, 2}, {2, 0}, {2, 1}, {2, 2}};
+// Spaceships for --ships. Each is written so that it travels DOWN the grid as
+// drawn (the glider drifts right as well); flipped top-to-bottom it travels
+// up. Every layout was checked by running it for one period.
+struct Ship {
+    const char* name;
+    int w, h;              // bounding box
+    int period, speed;     // moves `speed` rows every `period` steps
+    const char* rows[12];  // 'O' live, '.' dead, top to bottom
+};
+static const Ship SHIPS[] = {
+    {"glider",     3, 3,  4, 1,  {".O.", "..O", "OOO"}},
+    {"HWSS",       5, 7,  4, 2,  {".O.O.", "....O", "O...O", "O...O", "....O", ".O..O", "..OOO"}},
+    {"copperhead", 8, 12, 10, 1, {"...OO...", "...OO...", "........", "..OOOO..", ".OO..OO.", "O......O",
+                                  "........", "O......O", "O.O..O.O", "...OO...", "...OO...", ".OO..OO."}},
+    {"loafer",     9, 9,  7, 1,  {"O...OO..O", "OO...O..O", ".O...O.O.", "O.....O..", ".........",
+                                  ".OO......", "O..O.....", "O.O......", ".O......."}},
+};
+static const int NUM_SHIPS = sizeof(SHIPS) / sizeof(SHIPS[0]);
 
 // Build the starting grid: ~30% random soup, colour 1 (red) in the top half,
 // colour 2 (blue) in the bottom half. Returns the number of live cells.
 //
-// With `gliders`, a strip of GLIDER_STRIP rows on each side of the colour
-// border (row H / 2) is cleared and gliders are placed at its far edges,
-// pointing at the border: red ones travel down from the red side, blue ones
-// travel up from the blue side. Every second pair shares a column and meets
-// head-on at the border; the others pass each other and fly on into the
-// opposite soup, where their colour wins the births and seeds a colony on
-// the wrong side. A glider covers one row per four steps, so the first
-// collisions come after about 4 * GLIDER_STRIP steps.
-static const int GLIDER_STRIP = H / 32;  // rows cleared on each side of the border
-static const int GLIDER_GAP = W / 16;    // columns between gliders
+// With `ships`, a strip of SHIP_STRIP rows on each side of the colour border
+// (row H / 2) is cleared and one ship per SHIP_GAP columns is launched from
+// each edge of the strip, pointing at the border: red ships travel down from
+// the red side, blue ships travel up from the blue side. The ship type and
+// the column inside each lane are random (from the same seed as the soup),
+// so some pairs meet head-on at the border and others pass each other and
+// fly into the opposite soup, where their colour wins the births and seeds
+// a colony on the wrong side. The HWSS (c/2) gets there first, the glider
+// (c/4) next, then the loafer (c/7) and the copperhead (c/10).
+static const int SHIP_STRIP = H / 32;  // rows cleared on each side of the border
+static const int SHIP_GAP = W / 16;    // columns per lane, one ship per lane per side
 
-static int make_grid(std::vector<uint8_t>& grid, unsigned seed, bool gliders) {
+static int make_grid(std::vector<uint8_t>& grid, unsigned seed, bool ships) {
     grid.assign((size_t)H * W, 0);
     srand(seed);
     for (int r = 0; r < H; r++) {
@@ -534,33 +546,46 @@ static int make_grid(std::vector<uint8_t>& grid, unsigned seed, bool gliders) {
         }
     }
 
-    if (gliders) {
+    if (ships) {
         const int border = H / 2;
-        for (int r = border - GLIDER_STRIP; r < border + GLIDER_STRIP; r++)
+        for (int r = border - SHIP_STRIP; r < border + SHIP_STRIP; r++)
             memset(&grid[(size_t)r * W], 0, W);
 
-        // place the glider's top-left corner at (r, c); `up` flips it so it travels up
-        auto place = [&](int r, int c, uint8_t colour, bool up) {
-            for (int i = 0; i < 5; i++) {
-                int dr = up ? 2 - GLIDER[i][0] : GLIDER[i][0];
-                grid[(size_t)(r + dr) * W + c + GLIDER[i][1]] = colour;
+        // draw the ship with its top-left corner at (r, c); `up` flips it so it travels up
+        auto place = [&](const Ship& s, int r, int c, uint8_t colour, bool up) {
+            for (int i = 0; i < s.h; i++) {
+                int rr = up ? s.h - 1 - i : i;
+                for (int j = 0; j < s.w; j++)
+                    if (s.rows[i][j] == 'O')
+                        grid[(size_t)(r + rr) * W + c + j] = colour;
             }
         };
-        // W / GLIDER_GAP gliders per side; the widest offset, 3/4 of a gap
-        // plus the 3-cell shape, stays inside the last gap
-        // a few rows of margin keep the soup's own edge from eating the
-        // glider before it gets going
-        const int margin = GLIDER_STRIP / 8;
-        int placed = 0;
-        for (int k = 0; k < W / GLIDER_GAP; k++) {
-            int c = k * GLIDER_GAP + GLIDER_GAP / 4;
-            place(border - GLIDER_STRIP + margin, c, 1, false);          // red, near the top of the strip, heading down
-            int c_blue = (k % 2 == 0) ? c : c + GLIDER_GAP / 2;         // same column: head-on; offset: passes by
-            place(border + GLIDER_STRIP - margin - 3, c_blue, 2, true); // blue, near the bottom of the strip, heading up
-            placed++;
+        // a random ship that fits the half strip, a few rows in from the soup
+        // so the soup's own edge does not eat it before it gets going
+        const int margin = SHIP_STRIP / 8;
+        auto pick = [&]() -> const Ship& {
+            for (;;) {
+                const Ship& s = SHIPS[rand() % NUM_SHIPS];
+                if (margin + s.h <= SHIP_STRIP && s.w + 2 <= SHIP_GAP)
+                    return s;
+            }
+        };
+        int launched[NUM_SHIPS] = {0};
+        for (int k = 0; k < W / SHIP_GAP; k++) {
+            const Ship& red = pick();
+            int c = k * SHIP_GAP + 1 + rand() % (SHIP_GAP - red.w - 1);
+            place(red, border - SHIP_STRIP + margin, c, 1, false);           // heading down
+            launched[&red - SHIPS]++;
+
+            const Ship& blue = pick();
+            c = k * SHIP_GAP + 1 + rand() % (SHIP_GAP - blue.w - 1);
+            place(blue, border + SHIP_STRIP - margin - blue.h, c, 2, true);  // heading up
+            launched[&blue - SHIPS]++;
         }
-        printf("gliders: cleared rows %d..%d, placed %d red and %d blue gliders aimed at row %d\n",
-               border - GLIDER_STRIP, border + GLIDER_STRIP - 1, placed, placed, border);
+        printf("ships: cleared rows %d..%d, launched %d ships at row %d (", border - SHIP_STRIP, border + SHIP_STRIP - 1, 2 * (W / SHIP_GAP), border);
+        for (int i = 0; i < NUM_SHIPS; i++)
+            printf("%s%d %s", i ? ", " : "", launched[i], SHIPS[i].name);
+        printf(")\n");
     }
 
     int live = 0;
@@ -571,7 +596,7 @@ static int make_grid(std::vector<uint8_t>& grid, unsigned seed, bool gliders) {
 
 static void usage(const char* prog) {
     fprintf(stderr,
-            "usage: %s [--gpus N] [--steps N] [--seed N] [--frame-every N] [--mark-bands] [--full-size] [--balance] [--gliders] [--check]\n"
+            "usage: %s [--gpus N] [--steps N] [--seed N] [--frame-every N] [--mark-bands] [--full-size] [--balance] [--ships] [--check]\n"
             "  --gpus N         number of GPUs, 1 or 2; the grid is split into one band per GPU\n"
             "  --steps N        generations to run (default 100)\n"
             "  --seed N         seed for the random soup (default 1)\n"
@@ -581,8 +606,9 @@ static void usage(const char* prog) {
             "  --full-size      write images at one cell per pixel instead of %d x %d cells per pixel\n"
             "  --balance        with --gpus 2, time each GPU on a 1024-row slab first and split\n"
             "                   the rows in proportion instead of equally\n"
-            "  --gliders        clear a strip either side of the colour border and launch gliders\n"
-            "                   at it: red ones fly down, blue ones fly up (try --steps 600)\n"
+            "  --ships          clear a strip either side of the colour border and launch a random\n"
+            "                   mix of gliders, HWSS, copperheads and loafers at it: red ones fly\n"
+            "                   down, blue ones fly up (try --steps 800); --gliders means the same\n"
             "  --check          with --gpus 2, also run one band and compare the grids\n",
             prog, FRAMES_DIR, SHRINK, SHRINK);
     exit(2);
@@ -596,7 +622,7 @@ int main(int argc, char** argv) {
     bool mark_bands = false;
     bool full_size = false;
     bool balance = false;
-    bool gliders = false;
+    bool ships = false;
     bool check = false;
 
     for (int i = 1; i < argc; i++) {
@@ -615,8 +641,8 @@ int main(int argc, char** argv) {
             full_size = true;
         else if (a == "--balance")
             balance = true;
-        else if (a == "--gliders")
-            gliders = true;
+        else if (a == "--ships" || a == "--gliders")
+            ships = true;
         else if (a == "--check")
             check = true;
         else
@@ -642,7 +668,7 @@ int main(int argc, char** argv) {
     // the starting grid is built once, so every simulate() call below
     // (the run and the --check reference) starts from the same cells
     std::vector<uint8_t> soup;
-    int initial = make_grid(soup, seed, gliders);
+    int initial = make_grid(soup, seed, ships);
     printf("initial live cells: %d of %d (seed %u)\n", initial, H * W, seed);
 
     std::vector<uint8_t> rgb;
