@@ -72,6 +72,15 @@ neighbours.
   launch). The grid is then split in proportion, `rows[0] = H * r0 / (r0 +
   r1)`, rounded down to a multiple of the shrink factor so both strips still
   render whole pixels. The measured rates and the split are printed.
+- **`--gliders`:** `make_grid` clears a strip of `H / 32` rows on each side
+  of the colour border (row `H / 2`) and places a glider every `W / 16`
+  columns at each edge of the strip, pointing at the border: red gliders fly
+  down from the red soup, blue gliders fly up from the blue soup. Every second
+  pair shares a column and meets head-on at the border; the other pairs pass
+  each other and fly into the opposite soup, where their colour wins the
+  births and seeds a colony on the wrong side. A glider moves one row per
+  four steps, so the action starts around step 250 on the 2048 grid; use
+  `--steps 600` or more with `--frame-every` to watch it.
 - **`--check`:** with `--gpus 2`, also runs the same soup as one band and
   `memcmp`s the two final grids. A mismatch prints the first differing cell and
   exits 1; a halo index bug shows up here, before NCCL enters the picture.
@@ -85,6 +94,7 @@ make run                          # runs ./life_wars --gpus 1
 ./life_wars --gpus 2 --check      # one band per GPU, verified against one band
 ./life_wars --seed 7 --steps 250  # other soups and lengths
 ./life_wars --gpus 2 --steps 600 --frame-every 2 && ./make_video.sh   # frames/ -> life_wars.mp4
+./life_wars --gpus 2 --steps 800 --gliders --frame-every 2 && ./make_video.sh   # glider collisions at the border
 ```
 
 A 30% soup should settle to a few percent alive within 100 steps.
