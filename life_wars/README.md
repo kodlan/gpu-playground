@@ -58,6 +58,11 @@ neighbours.
   `frames/frame_00000.ppm`, `frame_00001.ppm`, ... The index counts frames,
   not steps, so the sequence has no gaps and `make_video.sh` can turn it into
   an MP4 and a GIF. The folder is created if missing; `make clean` removes it.
+  `make_video.sh --crop square` or `--crop vertical` cuts a window centred on
+  the colour border out of every frame (a square, or a 9:16 phone-shaped one),
+  which is the simple way to zoom in on the ships; `--size PX` sets the window
+  width, default a quarter of the frame height. Use it with `--full-size`
+  frames so the window is at one cell per pixel.
 - **Timing:** a `cudaEvent` is recorded on each GPU's stream before and after
   the step loop; `cudaEventElapsedTime` gives the milliseconds between the two
   marks on that stream, which includes the time the stream spent waiting for
@@ -99,6 +104,8 @@ make run                          # runs ./life_wars --gpus 1
 ./life_wars --seed 7 --steps 250  # other soups and lengths
 ./life_wars --gpus 2 --steps 600 --frame-every 2 && ./make_video.sh   # frames/ -> life_wars.mp4
 ./life_wars --gpus 2 --steps 800 --ships --frame-every 2 && ./make_video.sh   # spaceships collide at the border
+./life_wars --gpus 2 --steps 800 --ships --full-size --frame-every 4 && ./make_video.sh --crop square     # zoom on the border
+./make_video.sh --crop vertical --size 400 frames strip.mp4 30                   # 9:16 window, 400 px wide
 ```
 
 A 30% soup should settle to a few percent alive within 100 steps.
