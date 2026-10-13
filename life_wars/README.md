@@ -79,15 +79,20 @@ neighbours.
   render whole pixels. The measured rates and the split are printed.
 - **`--ships`** (or `--gliders`): `make_grid` clears a strip of `H / 32`
   rows on each side of the colour border (row `H / 2`) and launches one ship
-  per `W / 16` columns from each edge of the strip, pointing at the border:
+  per `W / 32` columns from each edge of the strip, pointing at the border:
   red ships fly down from the red soup, blue ships fly up from the blue soup.
   The type and the column inside each lane are random (same seed as the
   soup), so some pairs meet head-on at the border and others pass and fly
   into the opposite soup, where their colour wins the births and seeds a
-  colony on the wrong side. Four ships are in the table, each stored in its
+  colony on the wrong side. Five ships are in the table, each stored in its
   down-going orientation and flipped for the blue side: the glider (5 cells,
   c/4 diagonal), the heavyweight spaceship HWSS (13 cells, c/2), the loafer
-  (20 cells, c/7) and the copperhead (28 cells, c/10). The HWSS reaches the
+  (20 cells, c/7), the copperhead (28 cells, c/10) and Puffer 1 (25 cells,
+  c/2), a B-heptomino escorted by two LWSS that leaves a trail of debris of
+  its own colour behind it. Every `W / 4` columns a Gosper glider gun (36
+  cells) takes the place of the ships in its lanes and fires a glider at the
+  border every 30 steps for as long as it survives. Every layout was checked
+  in a small Life simulator before going into the table. The HWSS reaches the
   border in about 110 steps and the copperhead in about 560, so use
   `--steps 800` or more with `--frame-every` to watch it all.
 - **`--check`:** with `--gpus 2`, also runs the same soup as one band and

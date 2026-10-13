@@ -5,6 +5,7 @@
 #include <string.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -508,7 +509,7 @@ static std::vector<uint8_t> simulate(const std::vector<uint8_t>& init, int n, in
 struct Ship {
     const char* name;
     int w, h;              // bounding box
-    int period, speed;     // moves `speed` rows every `period` steps
+    int period, speed;     // moves `speed` rows every `period` steps (informative only)
     const char* rows[12];  // 'O' live, '.' dead, top to bottom
 };
 static const Ship SHIPS[] = {
@@ -518,6 +519,10 @@ static const Ship SHIPS[] = {
                                   "........", "O......O", "O.O..O.O", "...OO...", "...OO...", ".OO..OO."}},
     {"loafer",     9, 9,  7, 1,  {"O...OO..O", "OO...O..O", ".O...O.O.", "O.....O..", ".........",
                                   ".OO......", "O..O.....", "O.O......", ".O......."}},
+    // Puffer 1: a B-heptomino between two LWSS escorts; the escorts keep it
+    // going at c/2 and it leaves a trail of debris behind (period 128)
+    {"puffer",     22, 6, 128, 64, {".......O.OO...........", "O.O....OOO.........O.O", "...O....O.........O...",
+                                    "...O..............O...", "O..O..............O..O", ".OOO..............OOO."}},
 };
 static const int NUM_SHIPS = sizeof(SHIPS) / sizeof(SHIPS[0]);
 
@@ -531,10 +536,31 @@ static const int NUM_SHIPS = sizeof(SHIPS) / sizeof(SHIPS[0]);
 // the column inside each lane are random (from the same seed as the soup),
 // so some pairs meet head-on at the border and others pass each other and
 // fly into the opposite soup, where their colour wins the births and seeds
-// a colony on the wrong side. The HWSS (c/2) gets there first, the glider
-// (c/4) next, then the loafer (c/7) and the copperhead (c/10).
+// a colony on the wrong side. The HWSS and the puffer (c/2) get there first,
+// the glider (c/4) next, then the loafer (c/7) and the copperhead (c/10);
+// the puffer also leaves a trail of its colour behind it. Every GUN_EVERY
+// columns a glider gun sits in the ship row instead and fires a glider at
+// the border every 30 steps for as long as it survives.
 static const int SHIP_STRIP = H / 32;  // rows cleared on each side of the border
-static const int SHIP_GAP = W / 16;    // columns per lane, one ship per lane per side
+static const int SHIP_GAP = W / 32;    // columns per lane, one ship per lane per side
+static const int GUN_EVERY = W / 4;    // one glider gun per side every GUN_EVERY columns
+static const int GUN_NOTCH = H / 64;   // extra rows (and columns) cleared around each gun
+
+// The Gosper glider gun, 36 cells, fires a glider every 30 steps from its
+// right-hand end, heading down-right as drawn. Flipped top-to-bottom it
+// fires up-right. Verified for 300 steps: the gun stays intact and every
+// object it emits is a glider. It takes the place of the ships in the lanes
+// it covers and keeps firing at the border until something hits it.
+static const Ship GUN = {"gun", 36, 9, 30, 0, {
+    "........................O...........",
+    "......................O.O...........",
+    "............OO......OO............OO",
+    "...........O...O....OO............OO",
+    "OO........O.....O...OO..............",
+    "OO........O...O.OO....O.O...........",
+    "..........O.....O.......O...........",
+    "...........O...O....................",
+    "............OO......................"}};
 
 static int make_grid(std::vector<uint8_t>& grid, unsigned seed, bool ships) {
     grid.assign((size_t)H * W, 0);
@@ -570,19 +596,48 @@ static int make_grid(std::vector<uint8_t>& grid, unsigned seed, bool ships) {
                     return s;
             }
         };
-        int launched[NUM_SHIPS] = {0};
-        for (int k = 0; k < W / SHIP_GAP; k++) {
+        const int top = border - SHIP_STRIP + margin;  // red launch row (top-left corner)
+        auto bottom = [&](const Ship& s) { return border + SHIP_STRIP - margin - s.h; };  // blue launch row
+
+        // guns first, centred in their stretch; the lanes they cover get no ships
+        const int lanes = W / SHIP_GAP;
+        std::vector<bool> taken(lanes, false);
+        int guns = 0;
+        const bool gun_fits = margin + GUN.h <= SHIP_STRIP && GUN.w + 4 <= GUN_EVERY;  // not on tiny test grids
+        for (int g = 0; gun_fits && g < W / GUN_EVERY; g++) {
+            int c = g * GUN_EVERY + GUN_EVERY / 2 - GUN.w / 2;
+            // A gun cannot run from the soup's edge like a ship does, and the
+            // edge throws debris 20-30 rows into the strip within 100 steps.
+            // So carve a notch into the soup behind each gun: GUN_NOTCH more
+            // rows cleared, GUN.w + 2 * GUN_NOTCH columns wide.
+            int c0 = std::max(0, c - GUN_NOTCH), c1 = std::min(W, c + GUN.w + GUN_NOTCH);
+            for (int r = std::max(0, border - SHIP_STRIP - GUN_NOTCH); r < border - SHIP_STRIP; r++)
+                memset(&grid[(size_t)r * W + c0], 0, c1 - c0);
+            for (int r = border + SHIP_STRIP; r < std::min(H, border + SHIP_STRIP + GUN_NOTCH); r++)
+                memset(&grid[(size_t)r * W + c0], 0, c1 - c0);
+            place(GUN, top, c, 1, false);           // fires down-right
+            place(GUN, bottom(GUN), c, 2, true);    // fires up-right
+            for (int k = (c - 2) / SHIP_GAP; k <= (c + GUN.w + 1) / SHIP_GAP && k < lanes; k++)
+                taken[k] = true;
+            guns++;
+        }
+
+        int launched[NUM_SHIPS] = {0}, ships_placed = 0;
+        for (int k = 0; k < lanes; k++) {
+            if (taken[k])
+                continue;
             const Ship& red = pick();
             int c = k * SHIP_GAP + 1 + rand() % (SHIP_GAP - red.w - 1);
-            place(red, border - SHIP_STRIP + margin, c, 1, false);           // heading down
+            place(red, top, c, 1, false);           // heading down
             launched[&red - SHIPS]++;
 
             const Ship& blue = pick();
             c = k * SHIP_GAP + 1 + rand() % (SHIP_GAP - blue.w - 1);
-            place(blue, border + SHIP_STRIP - margin - blue.h, c, 2, true);  // heading up
+            place(blue, bottom(blue), c, 2, true);  // heading up
             launched[&blue - SHIPS]++;
+            ships_placed += 2;
         }
-        printf("ships: cleared rows %d..%d, launched %d ships at row %d (", border - SHIP_STRIP, border + SHIP_STRIP - 1, 2 * (W / SHIP_GAP), border);
+        printf("ships: cleared rows %d..%d; per side %d guns and %d ships aimed at row %d (", border - SHIP_STRIP, border + SHIP_STRIP - 1, guns, ships_placed / 2, border);
         for (int i = 0; i < NUM_SHIPS; i++)
             printf("%s%d %s", i ? ", " : "", launched[i], SHIPS[i].name);
         printf(")\n");
@@ -606,9 +661,10 @@ static void usage(const char* prog) {
             "  --full-size      write images at one cell per pixel instead of %d x %d cells per pixel\n"
             "  --balance        with --gpus 2, time each GPU on a 1024-row slab first and split\n"
             "                   the rows in proportion instead of equally\n"
-            "  --ships          clear a strip either side of the colour border and launch a random\n"
-            "                   mix of gliders, HWSS, copperheads and loafers at it: red ones fly\n"
-            "                   down, blue ones fly up (try --steps 800); --gliders means the same\n"
+            "  --ships          clear a strip either side of the colour border and launch glider\n"
+            "                   guns and a random mix of gliders, HWSS, copperheads, loafers and\n"
+            "                   puffers at it: red ones fly down, blue ones fly up (try --steps 800);\n"
+            "                   --gliders means the same\n"
             "  --check          with --gpus 2, also run one band and compare the grids\n",
             prog, FRAMES_DIR, SHRINK, SHRINK);
     exit(2);
