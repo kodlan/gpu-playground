@@ -1,24 +1,30 @@
 #!/usr/bin/env bash
 # PPM frames -> MP4 (and a GIF).
 #
-#   ./make_video.sh [--crop square|vertical] [--size PX] [dir] [out] [fps]
+#   ./make_video.sh [--crop square|vertical] [--size PX] [--center X] [dir] [out] [fps]
 #
 # --crop zooms in on the colour border, where the ships fly, by cutting a
 # window out of every frame centred on the middle row:
 #   square    a SIZE x SIZE window
 #   vertical  a 9:16 window, SIZE wide and SIZE * 16 / 9 tall (phone-screen shape)
 # SIZE defaults to a quarter of the frame height (512 px on full-size frames,
-# 128 on the default shrunk ones). The frame size is read from the first PPM.
+# 128 on the default shrunk ones). --center X puts the window's horizontal
+# centre at frame column X (default: the middle of the frame); on full-size
+# frames a column is a cell, so e.g. --center 320 looks at the first glider
+# gun duel (red gun at columns 238..274 firing down-right to the border).
+# The frame size is read from the first PPM.
 set -euo pipefail
 
-crop=""; size=""
+crop=""; size=""; center=""
 while [[ $# -gt 0 ]]; do
     case $1 in
         --crop) crop=$2; shift 2 ;;
         --size) size=$2; shift 2 ;;
+        --center) center=$2; shift 2 ;;
         --crop=*) crop=${1#--crop=}; shift ;;
         --size=*) size=${1#--size=}; shift ;;
-        -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+        --center=*) center=${1#--center=}; shift ;;
+        -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
         --*) echo "unknown option $1" >&2; exit 2 ;;
         *) break ;;
     esac
@@ -42,9 +48,11 @@ if [[ -n $crop ]]; then
     esac
     cw=$((cw / 2 * 2)); ch=$((ch / 2 * 2))                       # even
     (( cw <= fw && ch <= fh )) || { echo "crop ${cw}x${ch} does not fit the ${fw}x${fh} frames; lower --size" >&2; exit 2; }
-    cx=$(((fw - cw) / 2)); cy=$(((fh - ch) / 2))                 # centred on the border row
+    center=${center:-$((fw / 2))}
+    cx=$((center - cw / 2)); cy=$(((fh - ch) / 2))               # centred on --center and the border row
+    (( cx < 0 )) && cx=0; (( cx > fw - cw )) && cx=$((fw - cw))   # keep the window inside the frame
     filter="crop=$cw:$ch:$cx:$cy"
-    echo "cropping ${cw}x${ch} at ($cx,$cy) out of ${fw}x${fh} frames"
+    echo "cropping ${cw}x${ch} at ($cx,$cy) out of ${fw}x${fh} frames (centre column $((cx + cw / 2)))"
 fi
 
 ffmpeg -y -loglevel error -framerate "$fps" -i "$dir/frame_%05d.ppm" -vf "$filter" -c:v libx264 -pix_fmt yuv420p -crf 20 "$out"

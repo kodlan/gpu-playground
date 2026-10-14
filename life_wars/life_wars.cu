@@ -577,13 +577,15 @@ static int make_grid(std::vector<uint8_t>& grid, unsigned seed, bool ships) {
         for (int r = border - SHIP_STRIP; r < border + SHIP_STRIP; r++)
             memset(&grid[(size_t)r * W], 0, W);
 
-        // draw the ship with its top-left corner at (r, c); `up` flips it so it travels up
+        // draw the ship with its top-left corner at (r, c); `up` flips it so it
+        // travels up. Columns wrap, like in the kernel, so a shape may straddle
+        // the right edge.
         auto place = [&](const Ship& s, int r, int c, uint8_t colour, bool up) {
             for (int i = 0; i < s.h; i++) {
                 int rr = up ? s.h - 1 - i : i;
                 for (int j = 0; j < s.w; j++)
                     if (s.rows[i][j] == 'O')
-                        grid[(size_t)(r + rr) * W + c + j] = colour;
+                        grid[(size_t)(r + rr) * W + (c + j) % W] = colour;
             }
         };
         // a random ship that fits the half strip, a few rows in from the soup
@@ -599,26 +601,37 @@ static int make_grid(std::vector<uint8_t>& grid, unsigned seed, bool ships) {
         const int top = border - SHIP_STRIP + margin;  // red launch row (top-left corner)
         auto bottom = [&](const Ship& s) { return border + SHIP_STRIP - margin - s.h; };  // blue launch row
 
-        // guns first, centred in their stretch; the lanes they cover get no ships
+        // Guns first; the lanes they cover get no ships. Red gun g sits in the
+        // middle of its GUN_EVERY-wide stretch. The blue gun of every even
+        // stretch sits in the same columns, so its stream meets the red one
+        // head-on at the border and the two guns duel. The blue gun of every
+        // odd stretch is shifted by half a stretch, so both streams fly past
+        // each other and land in the enemy soup.
         const int lanes = W / SHIP_GAP;
         std::vector<bool> taken(lanes, false);
         int guns = 0;
         const bool gun_fits = margin + GUN.h <= SHIP_STRIP && GUN.w + 4 <= GUN_EVERY;  // not on tiny test grids
+        // A gun cannot run from the soup's edge like a ship does, and the
+        // edge throws debris 20-30 rows into the strip within 100 steps. So
+        // carve a notch into the soup behind each gun: GUN_NOTCH more rows
+        // cleared, GUN.w + 2 * GUN_NOTCH columns wide.
+        auto place_gun = [&](int c, uint8_t colour) {
+            int r0 = (colour == 1) ? std::max(0, border - SHIP_STRIP - GUN_NOTCH) : border + SHIP_STRIP;
+            int r1 = (colour == 1) ? border - SHIP_STRIP : std::min(H, border + SHIP_STRIP + GUN_NOTCH);
+            for (int r = r0; r < r1; r++)
+                for (int j = c - GUN_NOTCH; j < c + GUN.w + GUN_NOTCH; j++)
+                    grid[(size_t)r * W + (j + W) % W] = 0;
+            if (colour == 1)
+                place(GUN, top, c, 1, false);           // fires down-right
+            else
+                place(GUN, bottom(GUN), c, 2, true);    // fires up-right
+            for (int j = c - 2; j < c + GUN.w + 2; j++)
+                taken[((j + W) % W) / SHIP_GAP] = true;
+        };
         for (int g = 0; gun_fits && g < W / GUN_EVERY; g++) {
             int c = g * GUN_EVERY + GUN_EVERY / 2 - GUN.w / 2;
-            // A gun cannot run from the soup's edge like a ship does, and the
-            // edge throws debris 20-30 rows into the strip within 100 steps.
-            // So carve a notch into the soup behind each gun: GUN_NOTCH more
-            // rows cleared, GUN.w + 2 * GUN_NOTCH columns wide.
-            int c0 = std::max(0, c - GUN_NOTCH), c1 = std::min(W, c + GUN.w + GUN_NOTCH);
-            for (int r = std::max(0, border - SHIP_STRIP - GUN_NOTCH); r < border - SHIP_STRIP; r++)
-                memset(&grid[(size_t)r * W + c0], 0, c1 - c0);
-            for (int r = border + SHIP_STRIP; r < std::min(H, border + SHIP_STRIP + GUN_NOTCH); r++)
-                memset(&grid[(size_t)r * W + c0], 0, c1 - c0);
-            place(GUN, top, c, 1, false);           // fires down-right
-            place(GUN, bottom(GUN), c, 2, true);    // fires up-right
-            for (int k = (c - 2) / SHIP_GAP; k <= (c + GUN.w + 1) / SHIP_GAP && k < lanes; k++)
-                taken[k] = true;
+            place_gun(c, 1);
+            place_gun((g % 2 == 0) ? c : (c + GUN_EVERY / 2) % W, 2);
             guns++;
         }
 
@@ -637,7 +650,8 @@ static int make_grid(std::vector<uint8_t>& grid, unsigned seed, bool ships) {
             launched[&blue - SHIPS]++;
             ships_placed += 2;
         }
-        printf("ships: cleared rows %d..%d; per side %d guns and %d ships aimed at row %d (", border - SHIP_STRIP, border + SHIP_STRIP - 1, guns, ships_placed / 2, border);
+        printf("ships: cleared rows %d..%d; per side %d guns (red at columns %d + k * %d, blue the same for even k, +%d for odd k) and %d ships aimed at row %d (",
+               border - SHIP_STRIP, border + SHIP_STRIP - 1, guns, GUN_EVERY / 2, GUN_EVERY, GUN_EVERY / 2, ships_placed / 2, border);
         for (int i = 0; i < NUM_SHIPS; i++)
             printf("%s%d %s", i ? ", " : "", launched[i], SHIPS[i].name);
         printf(")\n");

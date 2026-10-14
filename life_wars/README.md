@@ -61,8 +61,10 @@ neighbours.
   `make_video.sh --crop square` or `--crop vertical` cuts a window centred on
   the colour border out of every frame (a square, or a 9:16 phone-shaped one),
   which is the simple way to zoom in on the ships; `--size PX` sets the window
-  width, default a quarter of the frame height. Use it with `--full-size`
-  frames so the window is at one cell per pixel.
+  width, default a quarter of the frame height, and `--center X` moves the
+  window sideways to frame column X, for example onto a gun. Use it with
+  `--full-size` frames so the window is at one cell per pixel and a column
+  is a cell.
 - **Timing:** a `cudaEvent` is recorded on each GPU's stream before and after
   the step loop; `cudaEventElapsedTime` gives the milliseconds between the two
   marks on that stream, which includes the time the stream spent waiting for
@@ -91,7 +93,13 @@ neighbours.
   c/2), a B-heptomino escorted by two LWSS that leaves a trail of debris of
   its own colour behind it. Every `W / 4` columns a Gosper glider gun (36
   cells) takes the place of the ships in its lanes and fires a glider at the
-  border every 30 steps for as long as it survives. Every layout was checked
+  border every 30 steps for as long as it survives; a notch cleared into the
+  soup behind each gun keeps the soup's edge debris off it. Red guns sit at
+  columns `W / 8 + k * W / 4` (centre of gun k). The blue gun of every even
+  stretch sits in the same columns, so its stream meets the red one head-on
+  at the border and the guns duel; the blue gun of every odd stretch is
+  shifted by `W / 8`, so both streams fly past each other into the enemy
+  soup. The program prints these positions. Every layout was checked
   in a small Life simulator before going into the table. The HWSS reaches the
   border in about 110 steps and the copperhead in about 560, so use
   `--steps 800` or more with `--frame-every` to watch it all.
@@ -111,6 +119,8 @@ make run                          # runs ./life_wars --gpus 1
 ./life_wars --gpus 2 --steps 800 --ships --frame-every 2 && ./make_video.sh   # spaceships collide at the border
 ./life_wars --gpus 2 --steps 800 --ships --full-size --frame-every 4 && ./make_video.sh --crop square     # zoom on the border
 ./make_video.sh --crop vertical --size 400 frames strip.mp4 30                   # 9:16 window, 400 px wide
+./make_video.sh --crop square --center 320 frames duel.mp4      # gun 0: red and blue streams meet at the border
+./make_video.sh --crop square --center 900 frames raid.mp4      # gun 1: red gun at 768, blue gun at 1024, streams get through
 ```
 
 A 30% soup should settle to a few percent alive within 100 steps.
