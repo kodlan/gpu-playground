@@ -59,12 +59,13 @@ neighbours.
   not steps, so the sequence has no gaps and `make_video.sh` can turn it into
   an MP4 and a GIF. The folder is created if missing; `make clean` removes it.
   `make_video.sh --crop square` or `--crop vertical` cuts a window centred on
-  the colour border out of every frame (a square, or a 9:16 phone-shaped one),
-  which is the simple way to zoom in on the ships; `--size PX` sets the window
-  width, default a quarter of the frame height, and `--center X` moves the
-  window sideways to frame column X, for example onto a gun. Use it with
-  `--full-size` frames so the window is at one cell per pixel and a column
-  is a cell.
+  the colour border out of every frame, which is the simple way to zoom in on
+  the ships. Square output is the window itself; vertical output is always
+  720 x 900 px, cut as a 4:5 window and scaled without smoothing. `--size PX`
+  sets the window width (default a quarter of the frame height for square,
+  720 for vertical on full-size frames, so that video is one cell per pixel)
+  and `--center X` moves the window sideways to frame column X, for example
+  onto a gun. Use it with `--full-size` frames so a column is a cell.
 - **Timing:** a `cudaEvent` is recorded on each GPU's stream before and after
   the step loop; `cudaEventElapsedTime` gives the milliseconds between the two
   marks on that stream, which includes the time the stream spent waiting for
@@ -118,7 +119,7 @@ make run                          # runs ./life_wars --gpus 1
 ./life_wars --gpus 2 --steps 600 --frame-every 2 && ./make_video.sh   # frames/ -> life_wars.mp4
 ./life_wars --gpus 2 --steps 800 --ships --frame-every 2 && ./make_video.sh   # spaceships collide at the border
 ./life_wars --gpus 2 --steps 800 --ships --full-size --frame-every 4 && ./make_video.sh --crop square     # zoom on the border
-./make_video.sh --crop vertical --size 400 frames strip.mp4 30                   # 9:16 window, 400 px wide
+./make_video.sh --crop vertical frames strip.mp4 30                              # 720 x 900 window, one cell per pixel
 ./make_video.sh --crop square --center 320 frames duel.mp4      # gun 0: red and blue streams meet at the border
 ./make_video.sh --crop square --center 900 frames raid.mp4      # gun 1: red gun at 768, blue gun at 1024, streams get through
 ```

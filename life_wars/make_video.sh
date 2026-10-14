@@ -5,10 +5,12 @@
 #
 # --crop zooms in on the colour border, where the ships fly, by cutting a
 # window out of every frame centred on the middle row:
-#   square    a SIZE x SIZE window
-#   vertical  a 9:16 window, SIZE wide and SIZE * 16 / 9 tall (phone-screen shape)
-# SIZE defaults to a quarter of the frame height (512 px on full-size frames,
-# 128 on the default shrunk ones). --center X puts the window's horizontal
+#   square    a SIZE x SIZE window, output at that size
+#   vertical  a 4:5 window, SIZE wide and SIZE * 5 / 4 tall, output at 720 x 900
+# SIZE defaults to a quarter of the frame height for square (512 px on
+# full-size frames, 128 on the default shrunk ones) and to 720 for vertical
+# where the frames are big enough, so full-size vertical video is one cell
+# per pixel; smaller windows are scaled up without smoothing. --center X puts the window's horizontal
 # centre at frame column X (default: the middle of the frame); on full-size
 # frames a column is a cell, so e.g. --center 320 looks at the first glider
 # gun duel (red gun at columns 238..274 firing down-right to the border).
@@ -40,10 +42,11 @@ read -r fw fh < <(head -c 64 "$first" | sed -n '2p')
 
 filter="pad=ceil(iw/2)*2:ceil(ih/2)*2"   # yuv420p needs even dimensions; a balanced band split can give an odd height
 if [[ -n $crop ]]; then
-    size=${size:-$((fh / 4))}
+    out_scale=""
     case $crop in
-        square)   cw=$size; ch=$size ;;
-        vertical) cw=$size; ch=$((size * 16 / 9)) ;;
+        square)   size=${size:-$((fh / 4))}; cw=$size; ch=$size ;;
+        vertical) if [[ -z $size ]]; then (( fw >= 720 && fh >= 900 )) && size=720 || size=$((fh / 4)); fi
+                  cw=$size; ch=$((size * 5 / 4)); out_scale=",scale=720:900:flags=neighbor" ;;
         *) echo "--crop must be square or vertical" >&2; exit 2 ;;
     esac
     cw=$((cw / 2 * 2)); ch=$((ch / 2 * 2))                       # even
@@ -51,8 +54,8 @@ if [[ -n $crop ]]; then
     center=${center:-$((fw / 2))}
     cx=$((center - cw / 2)); cy=$(((fh - ch) / 2))               # centred on --center and the border row
     (( cx < 0 )) && cx=0; (( cx > fw - cw )) && cx=$((fw - cw))   # keep the window inside the frame
-    filter="crop=$cw:$ch:$cx:$cy"
-    echo "cropping ${cw}x${ch} at ($cx,$cy) out of ${fw}x${fh} frames (centre column $((cx + cw / 2)))"
+    filter="crop=$cw:$ch:$cx:$cy$out_scale"
+    echo "cropping ${cw}x${ch} at ($cx,$cy) out of ${fw}x${fh} frames (centre column $((cx + cw / 2)))${out_scale:+, output 720x900}"
 fi
 
 ffmpeg -y -loglevel error -framerate "$fps" -i "$dir/frame_%05d.ppm" -vf "$filter" -c:v libx264 -pix_fmt yuv420p -crf 20 "$out"
